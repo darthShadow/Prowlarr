@@ -1,0 +1,370 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number (e.g., 2.3.3.1)"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build_name: ${{ steps.version.outputs.build_name }}
+      dotnet_version: ${{ steps.vars.outputs.dotnet_version }}
+      node_version: ${{ steps.vars.outputs.node_version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          sparse-checkout: azure-pipelines.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Extract versions from azure-pipelines.yml
+        id: vars
+        run: |
+          extract() { grep "^  $1:" azure-pipelines.yml | head -1 | sed "s/.*: *['\"]//;s/['\"].*//" ; }
+          DOTNET=$(extract dotnetVersion)
+          NODE=$(extract nodeVersion)
+          for v in DOTNET NODE; do
+            [ -n "${!v}" ] || { echo "::error::Failed to extract $v from azure-pipelines.yml"; exit 1; }
+          done
+          echo "dotnet_version=$DOTNET" >> "$GITHUB_OUTPUT"
+          echo "node_version=$NODE" >> "$GITHUB_OUTPUT"
+
+      - name: Determine version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_name=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+  build-backend:
+    runs-on: ubuntu-24.04
+    needs: setup
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ needs.setup.outputs.dotnet_version }}
+
+      - name: Build backend
+        env:
+          PROWLARRVERSION: ${{ needs.setup.outputs.version }}
+          BUILD_SOURCEBRANCHNAME: master
+        run: ./build.sh --backend
+
+      # build.sh --backend builds ALL RIDs (PackageTests joins them with ";").
+      # Prune to only linux-x64 and linux-musl-x64 to keep artifacts small.
+      - name: Prune unwanted RIDs
+        run: |
+          for dir in _output/net8.0 _output/Prowlarr.Update/net8.0 _tests/net8.0; do
+            if [ -d "$dir" ]; then
+              find "$dir" -maxdepth 1 -mindepth 1 -type d \
+                ! -name "linux-x64" ! -name "linux-musl-x64" \
+                -exec rm -rf {} +
+            fi
+          done
+          find _output -type f ! -path "*/publish/*" -exec rm -f {} +
+          find _output -depth -empty -type d -exec rmdir {} +
+          find _tests -type f ! -path "*/publish/*" -exec rm -f {} +
+          find _tests -depth -empty -type d -exec rmdir {} +
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: backend-output
+          path: _output/
+          retention-days: 5
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x64-tests
+          path: _tests/net8.0/linux-x64/publish/
+          retention-days: 5
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-musl-x64-tests
+          path: _tests/net8.0/linux-musl-x64/publish/
+          retention-days: 5
+
+  build-frontend:
+    runs-on: ubuntu-24.04
+    needs: setup
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ needs.setup.outputs.node_version }}
+          cache: yarn
+
+      - name: Build frontend
+        run: ./build.sh --frontend
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frontend-output
+          path: _output/UI/
+          retention-days: 5
+
+  unit-tests-linux:
+    runs-on: ubuntu-24.04
+    needs: [setup, build-backend]
+    steps:
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ needs.setup.outputs.dotnet_version }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-x64-tests
+          path: _tests/
+
+      - name: Run unit tests
+        run: |
+          chmod a+x _tests/test.sh
+          find _tests -name "Prowlarr.Test.Dummy" -exec chmod a+x {} \;
+          _tests/test.sh Linux Unit Test
+
+      # test.sh exits 0 for any non-negative code (line 79-84), swallowing failures.
+      # Grep TestResult.xml as a reliable signal instead.
+      - name: Check test results
+        if: always()
+        run: |
+          if grep -q 'result="Failed"' TestResult.xml 2>/dev/null; then
+            echo "::error::Unit tests failed"
+            grep 'result="Failed"' TestResult.xml | head -20
+            exit 1
+          fi
+
+  unit-tests-musl:
+    runs-on: ubuntu-24.04
+    needs: [setup, build-backend]
+    # See ci.yml unit-tests-musl comment for why we use alpine:3.23
+    # instead of upstream ghcr.io/servarr/testimages:alpine.
+    container:
+      image: alpine:3.23
+    timeout-minutes: 10
+    steps:
+      - name: Install dependencies
+        run: apk add --no-cache bash curl icu-libs sqlite-libs libstdc++ zlib
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ needs.setup.outputs.dotnet_version }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-musl-x64-tests
+          path: _tests/
+
+      - name: Run unit tests
+        run: |
+          chmod a+x _tests/test.sh
+          find _tests -name "Prowlarr.Test.Dummy" -exec chmod a+x {} \;
+          _tests/test.sh Linux Unit Test
+
+      - name: Check test results
+        if: always()
+        run: |
+          if grep -q 'result="Failed"' TestResult.xml 2>/dev/null; then
+            echo "::error::Unit tests on musl failed"
+            grep 'result="Failed"' TestResult.xml | head -20
+            exit 1
+          fi
+
+  package:
+    runs-on: ubuntu-24.04
+    needs: [build-backend, build-frontend, setup]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: backend-output
+          path: _output/
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-output
+          path: _output/UI/
+
+      - name: Package linux-x64
+        env:
+          PROWLARRVERSION: ${{ needs.setup.outputs.version }}
+          BUILD_SOURCEBRANCHNAME: master
+        run: ./build.sh --packages -r linux-x64 -f net8.0
+
+      - name: Package linux-musl-x64
+        env:
+          PROWLARRVERSION: ${{ needs.setup.outputs.version }}
+          BUILD_SOURCEBRANCHNAME: master
+        run: ./build.sh --packages -r linux-musl-x64 -f net8.0
+
+      - name: Create archives
+        env:
+          BUILD_NAME: ${{ needs.setup.outputs.build_name }}
+        run: |
+          mkdir -p dist/
+          tar czf "dist/Prowlarr.${BUILD_NAME}.linux-core-x64.tar.gz" \
+            -C _artifacts/linux-x64/net8.0 Prowlarr
+          tar czf "dist/Prowlarr.${BUILD_NAME}.linux-musl-core-x64.tar.gz" \
+            -C _artifacts/linux-musl-x64/net8.0 Prowlarr
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: dist/
+          retention-days: 5
+
+  integration-tests-musl:
+    runs-on: ubuntu-24.04
+    needs: [build-backend, package, setup]
+    # See ci.yml integration-tests-musl comment for why we use alpine:3.23.
+    container:
+      image: alpine:3.23
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: apk add --no-cache bash curl icu-libs sqlite-libs libstdc++ zlib
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ needs.setup.outputs.dotnet_version }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-musl-x64-tests
+          path: _tests/
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: dist/
+
+      - name: Extract package and assemble bin/
+        env:
+          BUILD_NAME: ${{ needs.setup.outputs.build_name }}
+        run: |
+          tar xzf "dist/Prowlarr.${BUILD_NAME}.linux-musl-core-x64.tar.gz" -C .
+          mv Prowlarr bin
+          chmod a+x bin/Prowlarr
+
+      - name: Run integration tests
+        run: |
+          chmod a+x _tests/test.sh
+          find _tests -name "Prowlarr.Test.Dummy" -exec chmod a+x {} \;
+          _tests/test.sh Linux Integration Test
+
+      - name: Check test results
+        if: always()
+        run: |
+          if grep -q 'result="Failed"' TestResult.xml 2>/dev/null; then
+            echo "::error::Integration tests failed"
+            grep 'result="Failed"' TestResult.xml | head -20
+            exit 1
+          fi
+
+  github-release:
+    runs-on: ubuntu-24.04
+    needs: [package, unit-tests-linux, unit-tests-musl, integration-tests-musl, setup]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.setup.outputs.version }}
+          name: v${{ needs.setup.outputs.version }}
+          generate_release_notes: true
+          files: dist/*
+          draft: false
+
+  docker:
+    runs-on: ubuntu-24.04
+    needs: [package, unit-tests-linux, unit-tests-musl, integration-tests-musl, setup]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: dist/
+
+      - name: Extract musl package for Docker
+        env:
+          BUILD_NAME: ${{ needs.setup.outputs.build_name }}
+        run: |
+          mkdir -p docker-build/
+          tar xzf "dist/Prowlarr.${BUILD_NAME}.linux-musl-core-x64.tar.gz" \
+            -C docker-build/ --strip-components=1
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/prowlarr
+          tags: |
+            type=sha
+            type=raw,value=${{ needs.setup.outputs.version }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+
+      - name: Generate build date
+        id: date
+        run: echo "date=$(date -u '+%Y-%m-%dT%H:%M:%S%:z')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_DATE=${{ steps.date.outputs.date }}
+            VERSION=${{ needs.setup.outputs.version }}
+            PROWLARR_BRANCH=master
