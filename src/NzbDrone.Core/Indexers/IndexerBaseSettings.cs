@@ -16,6 +16,11 @@ namespace NzbDrone.Core.Indexers
                 .GreaterThan(0)
                 .When(c => c.GrabLimit.HasValue)
                 .WithMessage("Should be greater than zero");
+
+            RuleFor(c => c.CacheTtlMinutes)
+                .GreaterThanOrEqualTo(0)
+                .When(c => c.CacheTtlMinutes.HasValue)
+                .WithMessage("Should be greater than or equal to zero");
         }
     }
 
@@ -29,6 +34,9 @@ namespace NzbDrone.Core.Indexers
 
         [FieldDefinition(3, Type = FieldType.Select, Label = "IndexerSettingsLimitsUnit", SelectOptions = typeof(IndexerLimitsUnit), HelpText = "IndexerSettingsLimitsUnitHelpText", Advanced = true)]
         public int LimitsUnit { get; set; } = (int)IndexerLimitsUnit.Day;
+
+        [FieldDefinition(4, Type = FieldType.Number, Label = "IndexerSettingsCacheTtl", HelpText = "IndexerSettingsCacheTtlHelpText", Advanced = true)]
+        public int? CacheTtlMinutes { get; set; }
     }
 
     public enum IndexerLimitsUnit
