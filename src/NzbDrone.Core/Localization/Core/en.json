@@ -432,6 +432,8 @@
   "IndexerSettingsPasskey": "Pass Key",
   "IndexerSettingsPreferMagnetUrl": "Prefer Magnet URL",
   "IndexerSettingsPreferMagnetUrlHelpText": "When enabled, this indexer will prefer the use of magnet URLs for grabs with fallback to torrent links",
+  "IndexerSettingsCacheTtl": "Cache TTL",
+  "IndexerSettingsCacheTtlHelpText": "Time in minutes to cache API query results for this indexer. Leave blank for global default. Values below global minimum are clamped.",
   "IndexerSettingsQueryLimit": "Query Limit",
   "IndexerSettingsQueryLimitHelpText": "The number of max queries as specified by the respective unit that {appName} will allow to the site",
   "IndexerSettingsRssKey": "RSS Key",
