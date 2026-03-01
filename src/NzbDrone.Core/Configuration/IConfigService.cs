@@ -53,6 +53,8 @@ namespace NzbDrone.Core.Configuration
 
         // Indexers
         bool LogIndexerResponse { get; set; }
+        int CacheDefaultTtlMinutes { get; set; }
+        int CacheMinimumTtlMinutes { get; set; }
 
         CertificateValidationType CertificateValidation { get; }
         string ApplicationUrl { get; }

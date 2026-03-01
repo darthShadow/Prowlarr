@@ -88,6 +88,20 @@ namespace NzbDrone.Core.Configuration
             set { SetValue("LogIndexerResponse", value); }
         }
 
+        // Newznab result cache: TTL used when no per-request or per-indexer override is set
+        public int CacheDefaultTtlMinutes
+        {
+            get { return GetValueInt("CacheDefaultTtlMinutes", 10); }
+            set { SetValue("CacheDefaultTtlMinutes", value); }
+        }
+
+        // Newznab result cache: minimum TTL floor (does not apply to cachetime=0 bypass)
+        public int CacheMinimumTtlMinutes
+        {
+            get { return GetValueInt("CacheMinimumTtlMinutes", 5); }
+            set { SetValue("CacheMinimumTtlMinutes", value); }
+        }
+
         public int FirstDayOfWeek
         {
             get { return GetValueInt("FirstDayOfWeek", (int)CultureInfo.CurrentCulture.DateTimeFormat.FirstDayOfWeek); }

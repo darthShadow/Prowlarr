@@ -35,6 +35,7 @@ namespace NzbDrone.Api.V1.Indexers
         private IIndexerStatusService _indexerStatusService;
         private IDownloadMappingService _downloadMappingService { get; set; }
         private IDownloadService _downloadService { get; set; }
+        private INewznabResultsCacheService _cacheService { get; set; }
         private readonly Logger _logger;
 
         public NewznabController(IndexerFactory indexerFactory,
@@ -43,6 +44,7 @@ namespace NzbDrone.Api.V1.Indexers
             IIndexerStatusService indexerStatusService,
             IDownloadMappingService downloadMappingService,
             IDownloadService downloadService,
+            INewznabResultsCacheService cacheService,
             Logger logger)
         {
             _indexerFactory = indexerFactory;
@@ -51,6 +53,7 @@ namespace NzbDrone.Api.V1.Indexers
             _indexerStatusService = indexerStatusService;
             _downloadMappingService = downloadMappingService;
             _downloadService = downloadService;
+            _cacheService = cacheService;
             _logger = logger;
         }
 
@@ -155,21 +158,11 @@ namespace NzbDrone.Api.V1.Indexers
                 return CreateResponse(CreateErrorXML(429, $"Indexer is disabled till {blockedIndexerStatusPre.DisabledTill.Value.ToLocalTime()} due to recent failures."), statusCode: StatusCodes.Status429TooManyRequests);
             }
 
-            // TODO Optimize this so it's not called here and in ReleaseSearchService (for manual search)
-            if (_indexerLimitService.AtQueryLimit(indexerDef))
-            {
-                var retryAfterQueryLimit = _indexerLimitService.CalculateRetryAfterQueryLimit(indexerDef);
-                AddRetryAfterHeader(retryAfterQueryLimit);
-
-                var queryLimit = ((IIndexerSettings)indexer.Definition.Settings).BaseSettings.QueryLimit;
-                var intervalLimitHours = _indexerLimitService.CalculateIntervalLimitHours(indexerDef);
-
-                return CreateResponse(CreateErrorXML(429, $"User configurable Indexer Query Limit of {queryLimit} in last {intervalLimitHours} hour(s) reached."), statusCode: StatusCodes.Status429TooManyRequests);
-            }
-
             switch (requestType)
             {
                 case "caps":
+                    // Note: caps is not subject to query limits — it returns locally-configured
+                    // capabilities without making upstream HTTP calls to the indexer.
                     var caps = indexer.GetCapabilities();
                     return CreateResponse(caps.ToXml());
                 case "search":
@@ -177,30 +170,97 @@ namespace NzbDrone.Api.V1.Indexers
                 case "music":
                 case "book":
                 case "movie":
-                    var results = await _releaseSearchService.Search(request, new List<int> { indexerDef.Id }, false);
+                    // Caching flow: fast-path cache check → dedup lock (if caching enabled) →
+                    // double-check cache → query limit → upstream search → cache result → rewrite URLs
+                    // cachetime=0 bypasses cache and dedup entirely (SearchAsync called directly)
 
-                    var blockedIndexerStatusPost = GetBlockedIndexerStatus(indexer);
+                    // Resolve cache TTL from three-tier config (request → indexer → global)
+                    var indexerSettings = (IIndexerSettings)indexerDef.Settings;
+                    var cacheTtl = _cacheService.ResolveTtl(request.cachetime, indexerSettings.BaseSettings.CacheTtlMinutes);
 
-                    if (blockedIndexerStatusPost?.DisabledTill != null)
+                    // Fast path: serve from cache (no lock needed)
+                    if (cacheTtl.HasValue)
                     {
-                        AddRetryAfterHeader(CalculateRetryAfterDisabledTill(blockedIndexerStatusPost.DisabledTill.Value));
-
-                        return CreateResponse(CreateErrorXML(429, $"Indexer is disabled till {blockedIndexerStatusPost.DisabledTill.Value.ToLocalTime()} due to recent failures."), statusCode: StatusCodes.Status429TooManyRequests);
-                    }
-
-                    foreach (var result in results.Releases)
-                    {
-                        result.DownloadUrl = result.DownloadUrl.IsNotNullOrWhiteSpace() ? _downloadMappingService.ConvertToProxyLink(new Uri(result.DownloadUrl), request.server, indexerDef.Id, result.Title).AbsoluteUri : null;
-
-                        if (result.DownloadProtocol == DownloadProtocol.Torrent)
+                        var cachedResults = _cacheService.Find(id, request);
+                        if (cachedResults != null)
                         {
-                            ((TorrentInfo)result).MagnetUrl = ((TorrentInfo)result).MagnetUrl.IsNotNullOrWhiteSpace() ? _downloadMappingService.ConvertToProxyLink(new Uri(((TorrentInfo)result).MagnetUrl), request.server, indexerDef.Id, result.Title).AbsoluteUri : null;
+                            return CreateSearchResponse(cachedResults, request, indexer, indexerDef, cloneReleases: true);
                         }
                     }
 
-                    var preferMagnetUrl = indexer.Protocol == DownloadProtocol.Torrent && indexerDef.Settings is ITorrentIndexerSettings torrentIndexerSettings && (torrentIndexerSettings.TorrentBaseSettings?.PreferMagnetUrl ?? false);
+                    // Search path — shared by dedup and non-dedup paths
+                    async Task<IActionResult> SearchAsync()
+                    {
+                        // Re-check cache after acquiring lock (another request may have populated it)
+                        if (cacheTtl.HasValue)
+                        {
+                            var deduped = _cacheService.Find(id, request);
+                            if (deduped != null)
+                            {
+                                return CreateSearchResponse(deduped, request, indexer, indexerDef, cloneReleases: true);
+                            }
+                        }
 
-                    return CreateResponse(results.ToXml(indexer.Protocol, preferMagnetUrl));
+                        // TODO Optimize this so it's not called here and in ReleaseSearchService (for manual search)
+                        // Query limit check is intentionally inside the dedup lock: cache hits (above)
+                        // bypass this check, so limits only count actual upstream requests. Moving it
+                        // outside would either count cache hits against limits or require duplication.
+                        if (_indexerLimitService.AtQueryLimit(indexerDef))
+                        {
+                            var retryAfterQueryLimit = _indexerLimitService.CalculateRetryAfterQueryLimit(indexerDef);
+                            AddRetryAfterHeader(retryAfterQueryLimit);
+
+                            var queryLimit = indexerSettings.BaseSettings.QueryLimit;
+                            var intervalLimitHours = _indexerLimitService.CalculateIntervalLimitHours(indexerDef);
+
+                            return CreateResponse(CreateErrorXML(429, $"User configurable Indexer Query Limit of {queryLimit} in last {intervalLimitHours} hour(s) reached."), statusCode: StatusCodes.Status429TooManyRequests);
+                        }
+
+                        var results = await _releaseSearchService.Search(request, new List<int> { indexerDef.Id }, false);
+
+                        var blockedIndexerStatusPost = GetBlockedIndexerStatus(indexer);
+
+                        if (blockedIndexerStatusPost?.DisabledTill != null)
+                        {
+                            AddRetryAfterHeader(CalculateRetryAfterDisabledTill(blockedIndexerStatusPost.DisabledTill.Value));
+
+                            return CreateResponse(CreateErrorXML(429, $"Indexer is disabled till {blockedIndexerStatusPost.DisabledTill.Value.ToLocalTime()} due to recent failures."), statusCode: StatusCodes.Status429TooManyRequests);
+                        }
+
+                        // Cache results before URL rewriting (store original URLs).
+                        // WARNING: MemberwiseClone is sufficient because URL rewriting only reassigns
+                        // string properties (DownloadUrl/MagnetUrl). If future code mutates collection
+                        // properties (Genres, Categories, etc.) on cached/served copies, use deep clone.
+                        if (cacheTtl.HasValue)
+                        {
+                            if (results.Releases.Count > 0)
+                            {
+                                var resultsToCache = new NewznabResults
+                                {
+                                    Releases = results.Releases.Select(r => (ReleaseInfo)r.Clone()).ToList()
+                                };
+                                _cacheService.Set(id, request, resultsToCache, cacheTtl.Value);
+                            }
+                            else
+                            {
+                                // Negative cache: store empty results with a short TTL to prevent
+                                // repeated upstream queries for searches that genuinely return nothing,
+                                // while still allowing newly available content to appear within 60s.
+                                var negativeTtl = TimeSpan.FromSeconds(Math.Min(60, cacheTtl.Value.TotalSeconds));
+                                _cacheService.Set(id, request, new NewznabResults { Releases = new List<ReleaseInfo>() }, negativeTtl);
+                            }
+                        }
+
+                        return CreateSearchResponse(results, request, indexer, indexerDef, cloneReleases: false);
+                    }
+
+                    // Serialize concurrent identical requests when caching is enabled
+                    if (cacheTtl.HasValue)
+                    {
+                        return await _cacheService.DeduplicateAsync<IActionResult>(id, request, SearchAsync);
+                    }
+
+                    return await SearchAsync();
                 default:
                     return CreateResponse(CreateErrorXML(202, $"No such function ({requestType})"), statusCode: StatusCodes.Status400BadRequest);
             }
@@ -355,6 +415,30 @@ namespace NzbDrone.Api.V1.Indexers
         private static int CalculateRetryAfterDisabledTill(DateTime disabledTill)
         {
             return Convert.ToInt32(disabledTill.ToLocalTime().Subtract(DateTime.Now).TotalSeconds);
+        }
+
+        private IActionResult CreateSearchResponse(NewznabResults results, NewznabRequest request, IIndexer indexer, IndexerDefinition indexerDef, bool cloneReleases)
+        {
+            // Clone releases when serving from cache to avoid mutating cached objects
+            var releases = cloneReleases
+                ? results.Releases.Select(r => (ReleaseInfo)r.Clone()).ToList()
+                : results.Releases;
+
+            foreach (var result in releases)
+            {
+                result.DownloadUrl = result.DownloadUrl.IsNotNullOrWhiteSpace() ? _downloadMappingService.ConvertToProxyLink(new Uri(result.DownloadUrl), request.server, indexerDef.Id, result.Title).AbsoluteUri : null;
+
+                if (result.DownloadProtocol == DownloadProtocol.Torrent)
+                {
+                    ((TorrentInfo)result).MagnetUrl = ((TorrentInfo)result).MagnetUrl.IsNotNullOrWhiteSpace() ? _downloadMappingService.ConvertToProxyLink(new Uri(((TorrentInfo)result).MagnetUrl), request.server, indexerDef.Id, result.Title).AbsoluteUri : null;
+                }
+            }
+
+            var rewrittenResults = cloneReleases ? new NewznabResults { Releases = releases } : results;
+
+            var preferMagnetUrl = indexer.Protocol == DownloadProtocol.Torrent && indexerDef.Settings is ITorrentIndexerSettings ts && (ts.TorrentBaseSettings?.PreferMagnetUrl ?? false);
+
+            return CreateResponse(rewrittenResults.ToXml(indexer.Protocol, preferMagnetUrl));
         }
     }
 }

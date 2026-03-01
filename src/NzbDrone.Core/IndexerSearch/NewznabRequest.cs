@@ -38,6 +38,9 @@ namespace NzbDrone.Core.IndexerSearch
         public string author { get; set; }
         public string title { get; set; }
         public string publisher { get; set; }
+
+        /// <summary>Cache TTL override in seconds. 0 = bypass cache entirely. null = use configured defaults.</summary>
+        public int? cachetime { get; set; }
         public string configured { get; set; }
         public string source { get; set; }
         public string host { get; set; }

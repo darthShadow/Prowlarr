@@ -21,6 +21,11 @@ namespace NzbDrone.Core.Indexers
                 .InclusiveBetween(IndexerBaseSettings.MinQueryTimeout, IndexerBaseSettings.MaxQueryTimeout)
                 .When(c => c.QueryTimeout.HasValue)
                 .WithMessage($"Should be between {IndexerBaseSettings.MinQueryTimeout} and {IndexerBaseSettings.MaxQueryTimeout} seconds");
+
+            RuleFor(c => c.CacheTtlMinutes)
+                .InclusiveBetween(IndexerBaseSettings.MinCacheTtlMinutes, IndexerBaseSettings.MaxCacheTtlMinutes)
+                .When(c => c.CacheTtlMinutes.HasValue)
+                .WithMessage($"Should be between {IndexerBaseSettings.MinCacheTtlMinutes} and {IndexerBaseSettings.MaxCacheTtlMinutes} minutes");
         }
     }
 
@@ -28,6 +33,8 @@ namespace NzbDrone.Core.Indexers
     {
         public const int MinQueryTimeout = 10;
         public const int MaxQueryTimeout = 300;
+        public const int MinCacheTtlMinutes = 0;
+        public const int MaxCacheTtlMinutes = 1440;
 
         [FieldDefinition(1, Type = FieldType.Number, Label = "IndexerSettingsQueryLimit", HelpText = "IndexerSettingsQueryLimitHelpText", Advanced = true)]
         public int? QueryLimit { get; set; }
@@ -41,6 +48,9 @@ namespace NzbDrone.Core.Indexers
         [FieldDefinition(4, Type = FieldType.Number, Label = "IndexerSettingsQueryTimeout", Unit = "seconds", HelpText = "IndexerSettingsQueryTimeoutHelpText", Advanced = true)]
         [FieldToken(TokenField.HelpText, "IndexerSettingsQueryTimeout", "defaultTimeoutSeconds", 100)]
         public int? QueryTimeout { get; set; }
+
+        [FieldDefinition(5, Type = FieldType.Number, Label = "IndexerSettingsCacheTtl", Unit = "minutes", HelpText = "IndexerSettingsCacheTtlHelpText", Advanced = true)]
+        public int? CacheTtlMinutes { get; set; }
     }
 
     public enum IndexerLimitsUnit
