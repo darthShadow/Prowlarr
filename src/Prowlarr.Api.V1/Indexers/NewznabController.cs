@@ -29,6 +29,14 @@ namespace NzbDrone.Api.V1.Indexers
     [ApiController]
     public class NewznabController : Controller
     {
+        // Probabilistic bypass: fraction of RSS cache hits that query upstream to refresh
+        // content before TTL expiry. At ~15 apps polling every 15 min, gives ~45% probability
+        // of detecting new content (e.g., morning release floods) within a 30-min TTL window,
+        // while adding only ~28 upstream calls/day per indexer — well within typical query limits.
+        // TODO: Replace with age-scaled probability (bypass probability increases as cache entry
+        // approaches its expiry time) for more precise, traffic-independent freshness control.
+        private const double BypassProbabilityRss = 0.02;
+
         private IIndexerFactory _indexerFactory { get; set; }
         private IReleaseSearchService _releaseSearchService { get; set; }
         private IIndexerLimitService _indexerLimitService { get; set; }
@@ -176,7 +184,16 @@ namespace NzbDrone.Api.V1.Indexers
 
                     // Resolve cache TTL from three-tier config (request → indexer → global)
                     var indexerSettings = (IIndexerSettings)indexerDef.Settings;
-                    var cacheTtl = _cacheService.ResolveTtl(request.cachetime, indexerSettings.BaseSettings.CacheTtlMinutes);
+                    var cacheTtl = _cacheService.ResolveTtl(id, request.cachetime, indexerSettings.BaseSettings.CacheTtlMinutes);
+
+                    // Computed once and reused for GetAdaptiveTtl and both Set calls
+                    var isRssLike = !request.cachetime.HasValue && IsRssLikeQuery(request);
+
+                    // Extend TTL for RSS-like queries based on result stability
+                    if (cacheTtl.HasValue && isRssLike)
+                    {
+                        cacheTtl = _cacheService.GetAdaptiveTtl(id, request, cacheTtl.Value);
+                    }
 
                     // Fast path: serve from cache (no lock needed)
                     if (cacheTtl.HasValue)
@@ -184,17 +201,40 @@ namespace NzbDrone.Api.V1.Indexers
                         var cachedResults = _cacheService.Find(id, request);
                         if (cachedResults != null)
                         {
+                            // Probabilistic bypass: ~2% of RSS cache hits go upstream to detect
+                            // new content before TTL expiry (e.g., morning release floods after
+                            // a quiet night builds high stability). Intentionally skips the dedup
+                            // lock — concurrent bypass collisions are negligible at this rate.
+                            // Skipped when at query limit to avoid wasting budget. Falls back to
+                            // cached result on any upstream exception.
+                            // See BypassProbabilityRss for planned age-scaled improvement.
+                            if (isRssLike
+                                && !_indexerLimitService.AtQueryLimit(indexerDef)
+                                && Random.Shared.NextDouble() < BypassProbabilityRss)
+                            {
+                                try
+                                {
+                                    return await SearchAsync(forceUpstream: true);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.Debug(ex, "Probabilistic bypass failed for indexer {0}, serving cached result", indexerDef.Name);
+                                }
+                            }
+
                             return CreateSearchResponse(cachedResults, request, indexer, indexerDef, cloneReleases: true);
                         }
                     }
 
-                    // Search path — shared by dedup and non-dedup paths
-                    async Task<IActionResult> SearchAsync()
+                    // Search path — shared by dedup, non-dedup, and bypass paths
+                    async Task<IActionResult> SearchAsync(bool forceUpstream = false)
                     {
-                        // Re-check cache after acquiring lock (another request may have populated it)
-                        if (cacheTtl.HasValue)
+                        // Re-check cache after acquiring dedup lock (another request may have
+                        // populated it). Skipped for probabilistic bypass requests which
+                        // explicitly want a fresh upstream call.
+                        if (!forceUpstream && cacheTtl.HasValue)
                         {
-                            var deduped = _cacheService.Find(id, request);
+                            var deduped = _cacheService.FindForRecheck(id, request);
                             if (deduped != null)
                             {
                                 return CreateSearchResponse(deduped, request, indexer, indexerDef, cloneReleases: true);
@@ -239,7 +279,7 @@ namespace NzbDrone.Api.V1.Indexers
                                 {
                                     Releases = results.Releases.Select(r => (ReleaseInfo)r.Clone()).ToList()
                                 };
-                                _cacheService.Set(id, request, resultsToCache, cacheTtl.Value);
+                                _cacheService.Set(id, request, resultsToCache, cacheTtl.Value, indexerDef.Name, isRssLike);
                             }
                             else
                             {
@@ -247,7 +287,7 @@ namespace NzbDrone.Api.V1.Indexers
                                 // repeated upstream queries for searches that genuinely return nothing,
                                 // while still allowing newly available content to appear within 60s.
                                 var negativeTtl = TimeSpan.FromSeconds(Math.Min(60, cacheTtl.Value.TotalSeconds));
-                                _cacheService.Set(id, request, new NewznabResults { Releases = new List<ReleaseInfo>() }, negativeTtl);
+                                _cacheService.Set(id, request, new NewznabResults { Releases = new List<ReleaseInfo>() }, negativeTtl, indexerDef.Name, isRssLike);
                             }
                         }
 
@@ -257,7 +297,8 @@ namespace NzbDrone.Api.V1.Indexers
                     // Serialize concurrent identical requests when caching is enabled
                     if (cacheTtl.HasValue)
                     {
-                        return await _cacheService.DeduplicateAsync<IActionResult>(id, request, SearchAsync);
+                        // Lambda required — SearchAsync has a bool param; Func<Task<T>> takes zero params
+                        return await _cacheService.DeduplicateAsync<IActionResult>(id, request, () => SearchAsync());
                     }
 
                     return await SearchAsync();
@@ -411,6 +452,32 @@ namespace NzbDrone.Api.V1.Indexers
                 HttpContext.Response.Headers.RetryAfter = $"{retryAfterSeconds}";
             }
         }
+
+        /// <summary>
+        /// Returns true if the request has no content-narrowing parameters — only
+        /// categories, limit/offset, age/size filters, and extended. These are RSS-style
+        /// polling queries where adaptive TTL and probabilistic bypass are beneficial.
+        /// </summary>
+        private static bool IsRssLikeQuery(NewznabRequest request) =>
+            string.IsNullOrWhiteSpace(request.q) &&
+            string.IsNullOrWhiteSpace(request.imdbid) &&
+            !request.tmdbid.HasValue &&
+            !request.rid.HasValue &&
+            !request.tvdbid.HasValue &&
+            !request.tvmazeid.HasValue &&
+            !request.traktid.HasValue &&
+            !request.doubanid.HasValue &&
+            !request.season.HasValue &&
+            string.IsNullOrWhiteSpace(request.ep) &&
+            string.IsNullOrWhiteSpace(request.album) &&
+            string.IsNullOrWhiteSpace(request.artist) &&
+            string.IsNullOrWhiteSpace(request.label) &&
+            string.IsNullOrWhiteSpace(request.track) &&
+            !request.year.HasValue &&
+            string.IsNullOrWhiteSpace(request.genre) &&
+            string.IsNullOrWhiteSpace(request.author) &&
+            string.IsNullOrWhiteSpace(request.title) &&
+            string.IsNullOrWhiteSpace(request.publisher);
 
         private static int CalculateRetryAfterDisabledTill(DateTime disabledTill)
         {

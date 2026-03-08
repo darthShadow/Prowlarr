@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -9,6 +11,7 @@ using NzbDrone.Common.Cache;
 using NzbDrone.Core.Configuration;
 using NzbDrone.Core.Indexers;
 using NzbDrone.Core.Messaging.Events;
+using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.ThingiProvider.Events;
 
 namespace NzbDrone.Core.IndexerSearch
@@ -27,8 +30,17 @@ namespace NzbDrone.Core.IndexerSearch
         /// <summary>Returns cached results or null on miss. Updates hit/miss stats.</summary>
         NewznabResults Find(int indexerId, NewznabRequest request);
 
-        /// <summary>Stores results with the given TTL. Caller must clone before storing to avoid mutation.</summary>
-        void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl);
+        /// <summary>
+        /// Returns cached results for post-dedup cache re-check. Does not update hit/miss
+        /// stats because the initial lookup was already recorded by Find on the fast path.
+        /// </summary>
+        NewznabResults FindForRecheck(int indexerId, NewznabRequest request);
+
+        /// <summary>
+        /// Stores results with the given TTL. Releases list is frozen via ReadOnlyCollection.
+        /// Pass isRssLike=true for RSS-style queries to enable stability tracking for adaptive TTL.
+        /// </summary>
+        void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null, bool isRssLike = false);
 
         /// <summary>Removes all cached entries and dedup locks for the given indexer.</summary>
         void InvalidateIndexer(int indexerId);
@@ -40,13 +52,20 @@ namespace NzbDrone.Core.IndexerSearch
         /// Resolves effective TTL. Returns null if caching should be bypassed (cachetime=0).
         /// Priority: per-request → per-indexer → global default. Floor: global minimum.
         /// </summary>
-        TimeSpan? ResolveTtl(int? requestCacheTimeSecs, int? indexerCacheTtlMins);
+        TimeSpan? ResolveTtl(int indexerId, int? requestCacheTimeSecs, int? indexerCacheTtlMins);
 
         /// <summary>
         /// Serializes concurrent requests for the same cache key to prevent thundering herd.
         /// Factory MUST re-check cache before fetching (double-check pattern for dedup correctness).
         /// </summary>
         Task<T> DeduplicateAsync<T>(int indexerId, NewznabRequest request, Func<Task<T>> factory);
+
+        /// <summary>
+        /// Returns an adaptive TTL based on per-key result stability for RSS-like queries.
+        /// Caller should only invoke this for RSS-like queries (no content-narrowing params).
+        /// Returns baseTtl unchanged if insufficient stability data exists.
+        /// </summary>
+        TimeSpan GetAdaptiveTtl(int indexerId, NewznabRequest request, TimeSpan baseTtl);
     }
 
     public class NewznabResultsCacheService : INewznabResultsCacheService,
@@ -63,7 +82,23 @@ namespace NzbDrone.Core.IndexerSearch
         // params, preventing cache key collisions from values containing '&' or '=' characters.
         private const char KeyDelimiter = '\x1F';
 
+        // Threshold for opportunistic key pruning in Set()
+        private const int KeyPruneThreshold = 50;
+
+        // Adaptive TTL: max multiplier for stable RSS queries (4.0x = up to 4x base TTL)
+        private const double MaxAdaptiveMultiplier = 4.0;
+
+        // Adaptive TTL: absolute ceiling regardless of multiplier.
+        // 30 min limits worst-case delay for morning-flood scenarios (quiet night
+        // builds high stability, then new releases arrive before cache expires).
+        private const int MaxAdaptiveTtlSecs = 1800;
+
         private static readonly TimeSpan StatsLogInterval = TimeSpan.FromMinutes(5);
+
+        // Max time to retain stability trackers/fingerprints after their cache entry
+        // expires. Bounds memory for abandoned RSS keys on low-volume indexers.
+        // 1 hour ≈ 2–6× typical RSS poll interval, generous for transient gaps.
+        private static readonly TimeSpan StabilityRetentionWindow = TimeSpan.FromHours(1);
 
         private readonly ICached<NewznabResults> _cache;
         private readonly IConfigService _configService;
@@ -74,6 +109,9 @@ namespace NzbDrone.Core.IndexerSearch
         // Per-key semaphores for DeduplicateAsync (not disposed on removal — see InvalidateIndexer)
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _keyLocks;
         private readonly ConcurrentDictionary<int, IndexerCacheStats> _indexerStats;
+        private readonly ConcurrentDictionary<string, int> _fingerprints;
+        private readonly ConcurrentDictionary<string, IndexerStabilityTracker> _stabilityTrackers;
+        private readonly ConcurrentDictionary<int, string> _indexerNames;
         private readonly object _logLock = new();
         private readonly Logger _logger;
         private long _globalHits;
@@ -87,38 +125,90 @@ namespace NzbDrone.Core.IndexerSearch
             _indexerKeys = new ConcurrentDictionary<int, ConcurrentDictionary<string, byte>>();
             _keyLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _indexerStats = new ConcurrentDictionary<int, IndexerCacheStats>();
+            _fingerprints = new ConcurrentDictionary<string, int>();
+            _stabilityTrackers = new ConcurrentDictionary<string, IndexerStabilityTracker>();
+            _indexerNames = new ConcurrentDictionary<int, string>();
             _lastGlobalLogTime = DateTime.UtcNow;
             _logger = logger;
         }
 
         public NewznabResults Find(int indexerId, NewznabRequest request)
         {
+            return FindInternal(indexerId, request, recordStats: true);
+        }
+
+        public NewznabResults FindForRecheck(int indexerId, NewznabRequest request)
+        {
+            return FindInternal(indexerId, request, recordStats: false);
+        }
+
+        private NewznabResults FindInternal(int indexerId, NewznabRequest request, bool recordStats)
+        {
             var key = GenerateCacheKey(indexerId, request);
             var result = _cache.Find(key);
 
-            var stats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
-
             if (result != null)
             {
-                Interlocked.Increment(ref _globalHits);
-                stats.IncrementHits();
-                LogStatsIfDue(indexerId, stats);
+                if (recordStats)
+                {
+                    var stats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
+                    Interlocked.Increment(ref _globalHits);
+                    stats.IncrementHits();
+                    LogStatsIfDue(indexerId, stats);
+                }
+
                 return result;
             }
 
-            Interlocked.Increment(ref _globalMisses);
-            stats.IncrementMisses();
-            LogStatsIfDue(indexerId, stats);
+            if (!recordStats)
+            {
+                return null;
+            }
 
-            // Prune dead key from tracking (expired naturally)
-            PruneKey(indexerId, key);
+            var missStats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
+            Interlocked.Increment(ref _globalMisses);
+            missStats.IncrementMisses();
+            LogStatsIfDue(indexerId, missStats);
+
+            // Probabilistic sweep of expired keys for this indexer. Fires on every miss
+            // when count exceeds threshold, or ~2% of misses otherwise. Ensures abandoned
+            // RSS keys are eventually reclaimed even on low-volume indexers. Mirrors the
+            // dedup-lock cleanup pattern (see PruneStaleLocks probabilistic trigger).
+            if (_indexerKeys.TryGetValue(indexerId, out var idxKeys)
+                && (idxKeys.Count > KeyPruneThreshold || Random.Shared.Next(50) == 0))
+            {
+                PruneExpiredKeys(indexerId, idxKeys);
+            }
 
             return null;
         }
 
-        public void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl)
+        public void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null, bool isRssLike = false)
         {
+            if (indexerName != null)
+            {
+                _indexerNames[indexerId] = indexerName;
+            }
+
             var key = GenerateCacheKey(indexerId, request);
+
+            // Track result stability for adaptive TTL only for RSS-like queries.
+            // Non-RSS queries (title/ID searches) are one-off and never use GetAdaptiveTtl,
+            // so tracking them wastes memory and would pollute stability stats.
+            if (isRssLike)
+            {
+                var fingerprint = ComputeFingerprint(results.Releases);
+                var unchanged = _fingerprints.TryGetValue(key, out var previous) && previous == fingerprint;
+                _fingerprints[key] = fingerprint;
+                var tracker = _stabilityTrackers.GetOrAdd(key, _ => new IndexerStabilityTracker());
+                tracker.RecordRefresh(unchanged);
+            }
+
+            // Freeze the releases list to prevent accidental mutation of cached data
+            if (results.Releases != null)
+            {
+                results.Releases = new ReadOnlyCollection<ReleaseInfo>(results.Releases);
+            }
 
             _cache.Set(key, results, ttl);
 
@@ -128,12 +218,12 @@ namespace NzbDrone.Core.IndexerSearch
             // Opportunistically prune expired keys for this indexer to prevent unbounded
             // growth from unique title searches (e.g. q=Some.Movie.2024.1080p.BluRay).
             // Only runs when there are enough tracked keys to warrant the scan.
-            if (keys.Count > 50)
+            if (keys.Count > KeyPruneThreshold)
             {
                 PruneExpiredKeys(indexerId, keys);
             }
 
-            _logger.Debug("Cached {0} releases for indexer {1}, TTL {2}s", results.Releases?.Count ?? 0, indexerId, ttl.TotalSeconds);
+            _logger.Debug("Cached {0} releases for indexer {1}, TTL {2}s", results.Releases?.Count ?? 0, GetIndexerLabel(indexerId), ttl.TotalSeconds);
         }
 
         public void InvalidateIndexer(int indexerId)
@@ -147,10 +237,15 @@ namespace NzbDrone.Core.IndexerSearch
                 {
                     _cache.Remove(key);
                     _keyLocks.TryRemove(key, out _);
+                    CleanupKeyTracking(key);
                 }
 
-                _logger.Debug("Invalidated {0} cached entries for indexer {1}", keys.Count, indexerId);
+                _logger.Debug("Invalidated {0} cached entries for indexer {1}", keys.Count, GetIndexerLabel(indexerId));
             }
+
+            // Clean up per-indexer tracking data
+            _indexerStats.TryRemove(indexerId, out _);
+            _indexerNames.TryRemove(indexerId, out _);
         }
 
         public void Clear()
@@ -158,19 +253,21 @@ namespace NzbDrone.Core.IndexerSearch
             _cache.Clear();
             _indexerKeys.Clear();
             _keyLocks.Clear();
+            _fingerprints.Clear();
+            _stabilityTrackers.Clear();
+            _indexerStats.Clear();
+            _indexerNames.Clear();
 
-            // _indexerStats intentionally not cleared — stats span cache lifecycle and are
-            // diagnostic only. Clearing them would lose trend data without functional benefit.
             _logger.Debug("Cleared all cached results");
         }
 
         /// <summary>
         /// Resolves effective cache TTL from three-tier config.
         /// Returns null if caching should be bypassed (cachetime=0).
-        /// Priority: per-request → per-indexer → global default.
-        /// Floor: global minimum (except cachetime=0 which bypasses entirely).
+        /// Priority: per-request → per-indexer → global default. Floor: global minimum.
+        /// For RSS-like queries, caller should also call GetAdaptiveTtl to extend based on stability.
         /// </summary>
-        public TimeSpan? ResolveTtl(int? requestCacheTimeSecs, int? indexerCacheTtlMins)
+        public TimeSpan? ResolveTtl(int indexerId, int? requestCacheTimeSecs, int? indexerCacheTtlMins)
         {
             // cachetime=0 bypasses cache entirely
             if (requestCacheTimeSecs is 0)
@@ -200,7 +297,44 @@ namespace NzbDrone.Core.IndexerSearch
             var floorSecs = globalMinMins * 60;
             effectiveSecs = Math.Max(effectiveSecs, floorSecs);
 
+            // TODO: Future enhancement — query budget preservation. When approaching the
+            // configured query limit, auto-extend TTLs to preserve budget for new queries.
+            // Would need IIndexerLimitService.GetQueryBudgetUsageRatio() or similar.
             return TimeSpan.FromSeconds(effectiveSecs);
+        }
+
+        /// <summary>
+        /// Returns an adaptive TTL based on per-key result stability. Only meaningful
+        /// for RSS-like queries where results stabilize over time. Returns baseTtl
+        /// unchanged if insufficient observations or no stability data exists.
+        /// Capped at MaxAdaptiveTtlSecs.
+        /// </summary>
+        public TimeSpan GetAdaptiveTtl(int indexerId, NewznabRequest request, TimeSpan baseTtl)
+        {
+            var key = GenerateCacheKey(indexerId, request);
+
+            if (_stabilityTrackers.TryGetValue(key, out var tracker))
+            {
+                var score = tracker.GetStabilityScore();
+                if (score > 0)
+                {
+                    var multiplier = 1.0 + (score * (MaxAdaptiveMultiplier - 1.0));
+                    var adaptiveSecs = (int)(baseTtl.TotalSeconds * multiplier);
+                    adaptiveSecs = Math.Min(adaptiveSecs, MaxAdaptiveTtlSecs);
+
+                    _logger.Debug(
+                        "Adaptive TTL for indexer {0}: stability {1:F2}, {2:F1}x, {3}s → {4}s",
+                        GetIndexerLabel(indexerId),
+                        score,
+                        multiplier,
+                        (int)baseTtl.TotalSeconds,
+                        adaptiveSecs);
+
+                    return TimeSpan.FromSeconds(adaptiveSecs);
+                }
+            }
+
+            return baseTtl;
         }
 
         /// <summary>
@@ -308,12 +442,23 @@ namespace NzbDrone.Core.IndexerSearch
             }
         }
 
+        private string GetIndexerLabel(int indexerId) =>
+            _indexerNames.TryGetValue(indexerId, out var name) ? $"{name} ({indexerId})" : indexerId.ToString();
+
+        private void CleanupKeyTracking(string key)
+        {
+            _fingerprints.TryRemove(key, out _);
+            _stabilityTrackers.TryRemove(key, out _);
+        }
+
         private void PruneKey(int indexerId, string key)
         {
             if (_indexerKeys.TryGetValue(indexerId, out var keys))
             {
                 keys.TryRemove(key, out _);
             }
+
+            CleanupKeyTracking(key);
         }
 
         /// <summary>
@@ -328,14 +473,24 @@ namespace NzbDrone.Core.IndexerSearch
             {
                 if (_cache.Find(trackedKey) == null)
                 {
-                    keys.TryRemove(trackedKey, out _);
-                    pruned++;
+                    // Preserve recent stability data for RSS-like keys across cache expiry.
+                    // Keep key in _indexerKeys so future prune cycles and InvalidateIndexer
+                    // can find and clean it up. Stale trackers are cleaned up normally.
+                    var preserveTracking = _stabilityTrackers.TryGetValue(trackedKey, out var tracker)
+                                           && !tracker.IsStale(StabilityRetentionWindow);
+
+                    if (!preserveTracking)
+                    {
+                        keys.TryRemove(trackedKey, out _);
+                        CleanupKeyTracking(trackedKey);
+                        pruned++;
+                    }
                 }
             }
 
             if (pruned > 0)
             {
-                _logger.Debug("Pruned {0} expired keys for indexer {1}, {2} remaining", pruned, indexerId, keys.Count);
+                _logger.Debug("Pruned {0} expired keys for indexer {1}, {2} remaining", pruned, GetIndexerLabel(indexerId), keys.Count);
             }
         }
 
@@ -386,24 +541,66 @@ namespace NzbDrone.Core.IndexerSearch
             }
         }
 
+        private (int TotalReleases, int StableKeys, double AvgStability) ComputeCacheStats(IEnumerable<string> keys)
+        {
+            var totalReleases = 0;
+            var stableKeys = 0;
+            var totalStability = 0.0;
+
+            foreach (var key in keys)
+            {
+                var cached = _cache.Find(key);
+                if (cached?.Releases != null)
+                {
+                    totalReleases += cached.Releases.Count;
+                }
+
+                if (_stabilityTrackers.TryGetValue(key, out var st))
+                {
+                    var s = st.GetStabilityScore();
+                    if (s > 0)
+                    {
+                        stableKeys++;
+                        totalStability += s;
+                    }
+                }
+            }
+
+            return (totalReleases, stableKeys, stableKeys > 0 ? totalStability / stableKeys : 0);
+        }
+
         private void LogStatsIfDue(int indexerId, IndexerCacheStats stats)
         {
             var now = DateTime.UtcNow;
 
-            // Per-indexer stats
-            if (stats.IsLogDue(now, StatsLogInterval))
+            // Per-indexer stats (atomic check-and-reset to avoid TOCTOU race)
+            var counts = stats.TryResetAndGetCounts(now, StatsLogInterval);
+            if (counts.HasValue)
             {
-                var (hits, misses) = stats.ResetAndGetCounts(now);
+                var (hits, misses) = counts.Value;
                 if (hits > 0 || misses > 0)
                 {
-                    var entryCount = _indexerKeys.TryGetValue(indexerId, out var k) ? k.Count : 0;
+                    var entryCount = 0;
+                    IEnumerable<string> indexerCacheKeys = Array.Empty<string>();
+
+                    if (_indexerKeys.TryGetValue(indexerId, out var k))
+                    {
+                        entryCount = k.Count;
+                        indexerCacheKeys = k.Keys;
+                    }
+
+                    var (totalReleases, stableKeys, avgStability) = ComputeCacheStats(indexerCacheKeys);
+
                     _logger.Info(
-                        "Cache stats for indexer {0}: {1} hits, {2} misses ({3:F0}% hit rate), {4} entries",
-                        indexerId,
+                        "Cache stats for indexer {0}: {1} hits, {2} misses ({3:F0}% hit rate), {4} entries ({5} releases), {6} stable keys (avg {7:F2})",
+                        GetIndexerLabel(indexerId),
                         hits,
                         misses,
                         hits + misses > 0 ? (double)hits / (hits + misses) * 100 : 0,
-                        entryCount);
+                        entryCount,
+                        totalReleases,
+                        stableKeys,
+                        avgStability);
                 }
             }
 
@@ -418,12 +615,18 @@ namespace NzbDrone.Core.IndexerSearch
 
                     if (globalHits > 0 || globalMisses > 0)
                     {
+                        var (globalReleases, globalStableKeys, globalAvgStability) =
+                            ComputeCacheStats(_indexerKeys.SelectMany(e => e.Value.Keys));
+
                         _logger.Info(
-                            "Cache stats (global): {0} hits, {1} misses ({2:F0}% hit rate), {3} entries",
+                            "Cache stats (global): {0} hits, {1} misses ({2:F0}% hit rate), {3} entries ({4} releases), {5} stable keys (avg {6:F2})",
                             globalHits,
                             globalMisses,
                             globalHits + globalMisses > 0 ? (double)globalHits / (globalHits + globalMisses) * 100 : 0,
-                            _cache.Count);
+                            _cache.Count,
+                            globalReleases,
+                            globalStableKeys,
+                            globalAvgStability);
                     }
                 }
             }
@@ -456,6 +659,109 @@ namespace NzbDrone.Core.IndexerSearch
         }
 
         /// <summary>
+        /// Computes a hash fingerprint to detect result changes. Order-independent:
+        /// GUIDs (or titles when no GUIDs) are sorted before hashing so {A,B} and
+        /// {B,A} produce the same fingerprint. Seeded with count so size changes are
+        /// always detected, even when all GUIDs are null.
+        /// </summary>
+        private static int ComputeFingerprint(IList<ReleaseInfo> releases)
+        {
+            if (releases == null || releases.Count == 0)
+            {
+                return 0;
+            }
+
+            var hash = default(HashCode);
+
+            // Seed with count so size changes are detected even when GUIDs are null
+            hash.Add(releases.Count);
+
+            var hasGuids = false;
+            foreach (var guid in releases
+                .Select(r => r.Guid)
+                .Where(g => g != null)
+                .OrderBy(g => g, StringComparer.Ordinal))
+            {
+                hash.Add(guid);
+                hasGuids = true;
+            }
+
+            // Fallback: hash sorted titles when no GUIDs are available (some indexers omit them)
+            if (!hasGuids)
+            {
+                foreach (var title in releases
+                    .Select(r => r.Title)
+                    .Where(t => t != null)
+                    .OrderBy(t => t, StringComparer.Ordinal))
+                {
+                    hash.Add(title);
+                }
+            }
+
+            return hash.ToHashCode();
+        }
+
+        /// <summary>
+        /// Tracks per-cache-key result stability using a decaying counter pair.
+        /// Stability score (0.0–1.0) indicates how often cached results match upstream
+        /// on refresh. Higher score → results rarely change → safe to extend cache TTL.
+        /// </summary>
+        private class IndexerStabilityTracker
+        {
+            // With adaptive TTL reducing upstream call frequency to ~2-3/hr per key,
+            // first decay at 20 takes 7-10 hours — too slow for day-night release cycles.
+            // 10 gives ~3-5 hr half-life: stable enough to extend TTL, fast enough to adapt.
+            private const int DecayThreshold = 10;
+
+            // Minimum stability observations before applying adaptive multiplier
+            private const int MinStabilityObservations = 3;
+            private long _unchangedRefreshes;
+            private long _totalRefreshes;
+            private long _lastUpdatedTicks = DateTime.UtcNow.Ticks;
+
+            /// <summary>
+            /// Returns true if the tracker has not been updated within the given window,
+            /// indicating the key is likely abandoned and tracking data can be reclaimed.
+            /// </summary>
+            public bool IsStale(TimeSpan maxAge) =>
+                DateTime.UtcNow.Ticks - Volatile.Read(ref _lastUpdatedTicks) > maxAge.Ticks;
+
+            public void RecordRefresh(bool unchanged)
+            {
+                Volatile.Write(ref _lastUpdatedTicks, DateTime.UtcNow.Ticks);
+                if (unchanged)
+                {
+                    Interlocked.Increment(ref _unchangedRefreshes);
+                }
+
+                var total = Interlocked.Increment(ref _totalRefreshes);
+
+                // Decay counters to weight toward recent observations
+                if (total >= DecayThreshold)
+                {
+                    // Not perfectly atomic across both fields, but close enough
+                    // for a heuristic that feeds into a soft TTL multiplier.
+                    Interlocked.Exchange(ref _unchangedRefreshes,
+                        Volatile.Read(ref _unchangedRefreshes) / 2);
+                    Interlocked.Exchange(ref _totalRefreshes,
+                        Volatile.Read(ref _totalRefreshes) / 2);
+                }
+            }
+
+            public double GetStabilityScore()
+            {
+                var total = Volatile.Read(ref _totalRefreshes);
+                if (total < MinStabilityObservations)
+                {
+                    return 0;
+                }
+
+                // Clamp: non-atomic decay can transiently make unchanged > total
+                return Math.Min((double)Volatile.Read(ref _unchangedRefreshes) / total, 1.0);
+            }
+        }
+
+        /// <summary>
         /// Thread-safe per-indexer cache statistics with periodic reset.
         /// </summary>
         private class IndexerCacheStats
@@ -468,18 +774,19 @@ namespace NzbDrone.Core.IndexerSearch
             public void IncrementHits() => Interlocked.Increment(ref _hits);
             public void IncrementMisses() => Interlocked.Increment(ref _misses);
 
-            public bool IsLogDue(DateTime now, TimeSpan interval)
+            /// <summary>
+            /// Atomically checks if logging is due and resets counters if so.
+            /// Returns null if not due, preventing TOCTOU race of separate check-then-reset.
+            /// </summary>
+            public (long Hits, long Misses)? TryResetAndGetCounts(DateTime now, TimeSpan interval)
             {
                 lock (_lock)
                 {
-                    return now - _lastLogTime >= interval;
-                }
-            }
+                    if (now - _lastLogTime < interval)
+                    {
+                        return null;
+                    }
 
-            public (long Hits, long Misses) ResetAndGetCounts(DateTime now)
-            {
-                lock (_lock)
-                {
                     var hits = Interlocked.Exchange(ref _hits, 0);
                     var misses = Interlocked.Exchange(ref _misses, 0);
                     _lastLogTime = now;

@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using FluentAssertions;
@@ -43,12 +45,129 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             };
         }
 
+        // Builds stability for a cache key via repeated identical-result Set calls.
+        // refreshCount=10 triggers exactly one decay (DecayThreshold=10), leaving
+        // unchanged=4, total=5, score=0.80, multiplier=3.4x.
+        private void BuildStability(int indexerId, NewznabRequest request, int refreshCount = 10)
+        {
+            for (var i = 0; i < refreshCount; i++)
+            {
+                Subject.Set(indexerId, request, MakeResults(3), TimeSpan.FromMinutes(10), isRssLike: true);
+            }
+        }
+
+        // Returns a single-release NewznabResults with a unique GUID per index.
+        // Calling with sequential indices guarantees every Set is detected as changed.
+        private static NewznabResults MakeVolatileResults(int index, string guidPrefix = "volatile")
+        {
+            return new NewznabResults
+            {
+                Releases = new List<ReleaseInfo>
+                {
+                    new ReleaseInfo { Title = $"Release {index}", Guid = $"{guidPrefix}-guid-{index}" }
+                }
+            };
+        }
+
+        private long GetIndexerMisses(int indexerId)
+        {
+            var statsField = typeof(NewznabResultsCacheService)
+                .GetField("_indexerStats", BindingFlags.Instance | BindingFlags.NonPublic);
+            var statsDictionary = statsField.GetValue(Subject);
+            var tryGetValue = statsDictionary.GetType().GetMethod("TryGetValue");
+
+            var args = new object[] { indexerId, null };
+            var exists = (bool)tryGetValue.Invoke(statsDictionary, args);
+            if (!exists)
+            {
+                return 0;
+            }
+
+            var stats = args[1];
+            var missesField = stats.GetType().GetField("_misses", BindingFlags.Instance | BindingFlags.NonPublic);
+            return (long)missesField.GetValue(stats);
+        }
+
+        private long GetGlobalHits()
+        {
+            var field = typeof(NewznabResultsCacheService)
+                .GetField("_globalHits", BindingFlags.Instance | BindingFlags.NonPublic);
+            return (long)field.GetValue(Subject);
+        }
+
+        private void MakeTrackerStale(NewznabRequest request, int indexerId = 1)
+        {
+            var key = NewznabResultsCacheService.GenerateCacheKey(indexerId, request);
+
+            var trackersField = typeof(NewznabResultsCacheService)
+                .GetField("_stabilityTrackers", BindingFlags.Instance | BindingFlags.NonPublic);
+            var trackers = trackersField.GetValue(Subject);
+
+            var tryGetValue = trackers.GetType().GetMethod("TryGetValue");
+            var args = new object[] { key, null };
+            if (!(bool)tryGetValue.Invoke(trackers, args))
+            {
+                Assert.Fail("MakeTrackerStale: no stability tracker found — ensure Set was called with isRssLike:true before this helper.");
+                return;
+            }
+
+            var tracker = args[1];
+            var ticksField = tracker.GetType()
+                .GetField("_lastUpdatedTicks", BindingFlags.Instance | BindingFlags.NonPublic);
+            ticksField.SetValue(tracker, DateTime.UtcNow.AddHours(-2).Ticks);
+        }
+
         // ── Cache CRUD ─────────────────────────────────────────────────────────
         [Test]
         public void Find_should_return_null_on_cache_miss()
         {
             var result = Subject.Find(1, MakeRequest(q: "test"));
             result.Should().BeNull();
+        }
+
+        [Test]
+        public void Find_should_not_reset_stability_tracker_on_expiry_miss()
+        {
+            var req = MakeRequest(cat: "5000");
+
+            // Build enough observations for adaptive TTL to engage.
+            for (var i = 0; i < 3; i++)
+            {
+                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMilliseconds(25), isRssLike: true);
+            }
+
+            Thread.Sleep(75);
+            Subject.Find(1, req).Should().BeNull("entry should expire to simulate refresh miss");
+
+            // Next refresh should continue existing stability history, not restart from zero.
+            Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(10), isRssLike: true);
+
+            var baseTtl = TimeSpan.FromSeconds(600);
+            Subject.GetAdaptiveTtl(1, req, baseTtl).TotalSeconds
+                .Should().BeGreaterThan(600, "expiry miss must not wipe adaptive history");
+        }
+
+        [Test]
+        public void FindForRecheck_should_not_record_additional_miss()
+        {
+            var req = MakeRequest(q: "recheck-miss");
+
+            Subject.Find(1, req).Should().BeNull();
+            Subject.FindForRecheck(1, req).Should().BeNull();
+
+            GetIndexerMisses(1).Should().Be(1, "dedup re-check miss must not double-count misses");
+        }
+
+        [Test]
+        public void FindForRecheck_hit_should_not_count_stats()
+        {
+            var req = MakeRequest(q: "recheck-hit");
+            Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(10));
+
+            var hitsBefore = GetGlobalHits();
+            Subject.FindForRecheck(1, req).Should().NotBeNull("cache entry exists");
+
+            GetGlobalHits().Should().Be(hitsBefore, "recheck hit must not inflate global hit counter");
         }
 
         [Test]
@@ -150,7 +269,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         [Test]
         public void ResolveTtl_should_return_null_for_cachetime_zero()
         {
-            var ttl = Subject.ResolveTtl(requestCacheTimeSecs: 0, indexerCacheTtlMins: null);
+            var ttl = Subject.ResolveTtl(1, requestCacheTimeSecs: 0, indexerCacheTtlMins: null);
             ttl.Should().BeNull("cachetime=0 is the bypass sentinel");
         }
 
@@ -158,7 +277,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         public void ResolveTtl_should_use_request_cachetime_when_provided()
         {
             // 900s > 300s floor → no clamping
-            var ttl = Subject.ResolveTtl(requestCacheTimeSecs: 900, indexerCacheTtlMins: 20);
+            var ttl = Subject.ResolveTtl(1, requestCacheTimeSecs: 900, indexerCacheTtlMins: 20);
             ttl.Should().Be(TimeSpan.FromSeconds(900), "per-request takes priority over per-indexer");
         }
 
@@ -166,7 +285,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         public void ResolveTtl_should_use_indexer_ttl_when_no_request_override()
         {
             // 15 min = 900s > 300s floor
-            var ttl = Subject.ResolveTtl(requestCacheTimeSecs: null, indexerCacheTtlMins: 15);
+            var ttl = Subject.ResolveTtl(1, requestCacheTimeSecs: null, indexerCacheTtlMins: 15);
             ttl.Should().Be(TimeSpan.FromSeconds(900));
         }
 
@@ -174,7 +293,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         public void ResolveTtl_should_use_global_default_when_no_overrides()
         {
             // global default = 10 min = 600s > 300s floor
-            var ttl = Subject.ResolveTtl(requestCacheTimeSecs: null, indexerCacheTtlMins: null);
+            var ttl = Subject.ResolveTtl(1, requestCacheTimeSecs: null, indexerCacheTtlMins: null);
             ttl.Should().Be(TimeSpan.FromSeconds(600));
         }
 
@@ -182,7 +301,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         public void ResolveTtl_should_enforce_global_minimum_floor()
         {
             // 60s < 300s floor → clamped to 300s
-            var ttl = Subject.ResolveTtl(requestCacheTimeSecs: 60, indexerCacheTtlMins: null);
+            var ttl = Subject.ResolveTtl(1, requestCacheTimeSecs: 60, indexerCacheTtlMins: null);
             ttl.Should().Be(TimeSpan.FromSeconds(300), "global minimum floor of 5 minutes applies");
         }
 
@@ -190,7 +309,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         public void ResolveTtl_should_clamp_negative_cachetime_to_minimum_floor()
         {
             // -1s < 300s floor → clamped to 300s (same as any below-floor value)
-            var ttl = Subject.ResolveTtl(requestCacheTimeSecs: -1, indexerCacheTtlMins: null);
+            var ttl = Subject.ResolveTtl(1, requestCacheTimeSecs: -1, indexerCacheTtlMins: null);
             ttl.Should().Be(TimeSpan.FromSeconds(300), "negative cachetime is clamped to global minimum floor");
         }
 
@@ -300,6 +419,290 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             Subject.Find(1, req).Should().BeNull("indexer 1 was bulk-deleted");
             Subject.Find(2, req).Should().NotBeNull("indexer 2 was not deleted");
             Subject.Find(3, req).Should().BeNull("indexer 3 was bulk-deleted");
+        }
+
+        // ── Adaptive TTL ──────────────────────────────────────────────────────
+        [Test]
+        public void GetAdaptiveTtl_should_extend_ttl_for_stable_rss_query()
+        {
+            // RSS-like query: no content-narrowing params, only categories
+            var req = MakeRequest(cat: "5000");
+
+            BuildStability(1, req);
+
+            // stability ≈ 4/5 after first decay (9 unchanged → halved to 4, total halved to 5) → multiplier ~3.4x → adaptive TTL > base
+            var baseTtl = TimeSpan.FromSeconds(600);
+            var adaptiveTtl = Subject.GetAdaptiveTtl(1, req, baseTtl);
+            adaptiveTtl.TotalSeconds.Should().BeGreaterThan(600, "stable RSS should get extended TTL");
+        }
+
+        [Test]
+        public void GetAdaptiveTtl_should_not_extend_for_volatile_rss_query()
+        {
+            var req = MakeRequest(cat: "5000");
+
+            // Every refresh has different GUIDs (isRssLike=true)
+            for (var i = 0; i < 10; i++)
+            {
+                Subject.Set(1, req, MakeVolatileResults(i), TimeSpan.FromMinutes(10), isRssLike: true);
+            }
+
+            var baseTtl = TimeSpan.FromSeconds(600);
+            var adaptiveTtl = Subject.GetAdaptiveTtl(1, req, baseTtl);
+            adaptiveTtl.Should().Be(baseTtl, "volatile results should not extend TTL");
+        }
+
+        [Test]
+        public void GetAdaptiveTtl_should_return_base_when_no_stability_data()
+        {
+            var req = MakeRequest(cat: "5000");
+            var baseTtl = TimeSpan.FromSeconds(600);
+
+            // No stability data (isRssLike defaulted to false — not an RSS Set call)
+            var adaptiveTtl = Subject.GetAdaptiveTtl(1, req, baseTtl);
+            adaptiveTtl.Should().Be(baseTtl, "no stability data means no extension");
+        }
+
+        [Test]
+        public void GetAdaptiveTtl_should_not_track_non_rss_queries()
+        {
+            // Title search: same results every time, but isRssLike=false
+            var req = MakeRequest(q: "specific.title", cat: "5000");
+            for (var i = 0; i < 10; i++)
+            {
+                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(10), isRssLike: false);
+            }
+
+            // No stability tracked → adaptive TTL returns base unchanged
+            var baseTtl = TimeSpan.FromSeconds(600);
+            Subject.GetAdaptiveTtl(1, req, baseTtl)
+                .Should().Be(baseTtl, "non-RSS queries are never tracked for stability");
+        }
+
+        [Test]
+        public void GetAdaptiveTtl_should_cap_at_maximum()
+        {
+            var req = MakeRequest(cat: "5000");
+
+            for (var i = 0; i < 10; i++)
+            {
+                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(30), isRssLike: true);
+            }
+
+            // 1800s base × ~3.4 multiplier (score 4/5 after decay) = ~6120s, capped at 1800s
+            var baseTtl = TimeSpan.FromSeconds(1800);
+            var adaptiveTtl = Subject.GetAdaptiveTtl(1, req, baseTtl);
+            adaptiveTtl.TotalSeconds.Should().BeLessOrEqualTo(1800, "adaptive TTL capped at 30 min");
+        }
+
+        [Test]
+        public void GetAdaptiveTtl_should_track_per_key_not_per_indexer()
+        {
+            var rssReq = MakeRequest(cat: "5000");
+            var rssReq2 = MakeRequest(cat: "7000");
+
+            // cat=5000 RSS: stable
+            BuildStability(1, rssReq);
+
+            // cat=7000 RSS: volatile
+            for (var i = 0; i < 10; i++)
+            {
+                Subject.Set(1, rssReq2, MakeVolatileResults(i, "rss2"), TimeSpan.FromMinutes(10), isRssLike: true);
+            }
+
+            var baseTtl = TimeSpan.FromSeconds(600);
+
+            // cat=5000 should be extended (stable)
+            Subject.GetAdaptiveTtl(1, rssReq, baseTtl).TotalSeconds
+                .Should().BeGreaterThan(600, "stable cat=5000 key should get extended TTL");
+
+            // cat=7000 should NOT be extended (volatile)
+            Subject.GetAdaptiveTtl(1, rssReq2, baseTtl)
+                .Should().Be(baseTtl, "volatile cat=7000 key should stay at base TTL");
+        }
+
+        // ── Clone hardening ──────────────────────────────────────────────────
+        [Test]
+        public void Set_should_freeze_releases_list()
+        {
+            Subject.Set(1, MakeRequest(q: "frozen"), MakeResults(3), TimeSpan.FromMinutes(10));
+
+            var found = Subject.Find(1, MakeRequest(q: "frozen"));
+            found.Should().NotBeNull();
+
+            // Cached releases list should be frozen — mutation throws
+            Assert.Throws<NotSupportedException>(() => found.Releases.Add(new ReleaseInfo()));
+        }
+
+        // ── Stability tracker reset ──────────────────────────────────────────
+        [Test]
+        public void InvalidateIndexer_should_reset_stability_tracker()
+        {
+            var req = MakeRequest(cat: "5000");
+
+            BuildStability(1, req);
+
+            Subject.InvalidateIndexer(1);
+
+            var baseTtl = TimeSpan.FromSeconds(600);
+            Subject.GetAdaptiveTtl(1, req, baseTtl)
+                .Should().Be(baseTtl, "invalidation resets stability tracker");
+        }
+
+        [Test]
+        public void PruneExpiredKeys_should_preserve_stability_tracker_for_recent_rss_key()
+        {
+            var rssReq = MakeRequest(cat: "5000");
+
+            // Build stability — 3 identical Sets → score > 0 (unchanged=2, total=3)
+            for (var i = 0; i < 3; i++)
+            {
+                Subject.Set(1, rssReq, MakeResults(3), TimeSpan.FromMilliseconds(25), isRssLike: true);
+            }
+
+            // Flood 51 filler keys to push keys.Count above KeyPruneThreshold (50)
+            for (var i = 0; i < 51; i++)
+            {
+                Subject.Set(1, MakeRequest(q: $"filler-{i}"), MakeResults(1), TimeSpan.FromMilliseconds(25));
+            }
+
+            // Wait for all entries to expire
+            Thread.Sleep(75);
+
+            // This Set pushes keys.Count > 50 → triggers PruneExpiredKeys
+            Subject.Set(1, MakeRequest(q: "trigger"), MakeResults(1), TimeSpan.FromMinutes(10));
+
+            // Stability tracker must survive PruneExpiredKeys
+            var baseTtl = TimeSpan.FromSeconds(600);
+            Subject.GetAdaptiveTtl(1, rssReq, baseTtl).TotalSeconds
+                .Should().BeGreaterThan(600, "PruneExpiredKeys must not destroy stability trackers for recent RSS keys");
+        }
+
+        [Test]
+        public void PruneExpiredKeys_should_reclaim_stale_stability_tracker()
+        {
+            var rssReq = MakeRequest(cat: "5000");
+
+            // Build stability with short TTL
+            for (var i = 0; i < 3; i++)
+            {
+                Subject.Set(1, rssReq, MakeResults(3), TimeSpan.FromMilliseconds(25), isRssLike: true);
+            }
+
+            // Back-date tracker to simulate abandonment (IsStale = true)
+            MakeTrackerStale(rssReq);
+
+            // Flood 51 filler keys to push keys.Count above KeyPruneThreshold (50)
+            for (var i = 0; i < 51; i++)
+            {
+                Subject.Set(1, MakeRequest(q: $"filler-{i}"), MakeResults(1), TimeSpan.FromMilliseconds(25));
+            }
+
+            // Wait for all entries to expire
+            Thread.Sleep(75);
+
+            // Trigger PruneExpiredKeys with all entries expired
+            Subject.Set(1, MakeRequest(q: "trigger"), MakeResults(1), TimeSpan.FromMinutes(10));
+
+            // Stale tracker must be reclaimed → adaptive TTL returns base unchanged
+            var baseTtl = TimeSpan.FromSeconds(600);
+            Subject.GetAdaptiveTtl(1, rssReq, baseTtl)
+                .Should().Be(baseTtl, "PruneExpiredKeys must reclaim stale stability trackers");
+        }
+
+        // ── Fingerprint edge cases ────────────────────────────────────────────
+
+        // Verifies count-seed + title fallback: two null-GUID sets with different
+        // titles but identical count must produce distinct fingerprints and be
+        // detected as volatile (score stays 0 → adaptive TTL returns base).
+        [Test]
+        public void GetAdaptiveTtl_should_detect_change_when_all_guids_null()
+        {
+            var req = MakeRequest(cat: "5000");
+
+            for (var i = 0; i < 10; i++)
+            {
+                var titles = i % 2 == 0
+                    ? new[] { "Alpha", "Beta", "Gamma" }
+                    : new[] { "Delta", "Epsilon", "Zeta" };
+
+                var results = new NewznabResults
+                {
+                    Releases = titles.Select(t => new ReleaseInfo { Title = t }).ToList<ReleaseInfo>()
+                };
+                Subject.Set(1, req, results, TimeSpan.FromMinutes(10), isRssLike: true);
+            }
+
+            var baseTtl = TimeSpan.FromSeconds(600);
+            Subject.GetAdaptiveTtl(1, req, baseTtl)
+                .Should().Be(baseTtl, "alternating null-GUID sets with distinct titles should be volatile");
+        }
+
+        // Verifies GUIDs are sorted before hashing: [a,b,c] and [c,b,a] must
+        // produce the same fingerprint and be counted as unchanged → stable →
+        // adaptive TTL extended above base.
+        [Test]
+        public void GetAdaptiveTtl_should_be_order_independent()
+        {
+            var req = MakeRequest(cat: "5000");
+
+            for (var i = 0; i < 10; i++)
+            {
+                var guids = i % 2 == 0
+                    ? new[] { "guid-a", "guid-b", "guid-c" }
+                    : new[] { "guid-c", "guid-b", "guid-a" };
+
+                var results = new NewznabResults
+                {
+                    Releases = guids.Select(g => new ReleaseInfo { Title = g, Guid = g }).ToList<ReleaseInfo>()
+                };
+                Subject.Set(1, req, results, TimeSpan.FromMinutes(10), isRssLike: true);
+            }
+
+            var baseTtl = TimeSpan.FromSeconds(600);
+            Subject.GetAdaptiveTtl(1, req, baseTtl).TotalSeconds
+                .Should().BeGreaterThan(600, "reordered identical GUIDs should be treated as stable");
+        }
+
+        // ── Stability decay ──────────────────────────────────────────────────
+
+        // Verifies decay adapts to changing conditions: after building high stability,
+        // sustained volatile refreshes halve the unchanged counter three times (at
+        // total=10,20,30) until unchanged=0, score=0 → adaptive TTL returns base.
+        [Test]
+        public void GetAdaptiveTtl_should_decay_after_stable_to_volatile_transition()
+        {
+            var req = MakeRequest(cat: "5000");
+            var baseTtl = TimeSpan.FromSeconds(600);
+
+            BuildStability(1, req, 10);
+            Subject.GetAdaptiveTtl(1, req, baseTtl).TotalSeconds
+                .Should().BeGreaterThan(600, "precondition: stable phase must extend TTL");
+
+            // 20 volatile refreshes trigger two more decay cycles:
+            // cycle at refresh 5: unchanged=4→2; cycle at refresh 10: 2→1;
+            // cycle at refresh 15: 1→0; score collapses to 0.
+            for (var i = 0; i < 20; i++)
+            {
+                Subject.Set(1, req, MakeVolatileResults(i), TimeSpan.FromMinutes(10), isRssLike: true);
+            }
+
+            Subject.GetAdaptiveTtl(1, req, baseTtl)
+                .Should().Be(baseTtl, "stability must decay to zero after sustained volatile period");
+        }
+
+        // ── Clear resets stability ────────────────────────────────────────────
+        [Test]
+        public void Clear_should_reset_stability_tracker()
+        {
+            var req = MakeRequest(cat: "5000");
+            BuildStability(1, req);
+
+            Subject.Clear();
+
+            var baseTtl = TimeSpan.FromSeconds(600);
+            Subject.GetAdaptiveTtl(1, req, baseTtl)
+                .Should().Be(baseTtl, "Clear must wipe stability trackers");
         }
     }
 }
