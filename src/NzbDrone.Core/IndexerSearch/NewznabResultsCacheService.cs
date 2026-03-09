@@ -27,7 +27,7 @@ namespace NzbDrone.Core.IndexerSearch
     /// </summary>
     public interface INewznabResultsCacheService
     {
-        /// <summary>Returns cached results or null on miss. Updates hit/miss stats.</summary>
+        /// <summary>Returns cached results or null on miss. Updates hit/miss stats only for adaptive-RSS queries.</summary>
         NewznabResults Find(int indexerId, NewznabRequest request);
 
         /// <summary>
@@ -38,9 +38,9 @@ namespace NzbDrone.Core.IndexerSearch
 
         /// <summary>
         /// Stores results with the given TTL. Releases list is frozen via ReadOnlyCollection.
-        /// Pass isRssLike=true for RSS-style queries to enable stability tracking for adaptive TTL.
+        /// Stability tracking scope is derived from the request to keep adaptive TTL and stats aligned.
         /// </summary>
-        void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null, bool isRssLike = false);
+        void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null);
 
         /// <summary>Removes all cached entries and dedup locks for the given indexer.</summary>
         void InvalidateIndexer(int indexerId);
@@ -146,10 +146,11 @@ namespace NzbDrone.Core.IndexerSearch
         {
             var key = GenerateCacheKey(indexerId, request);
             var result = _cache.Find(key);
+            var shouldRecordStats = recordStats && NewznabCacheQueryPolicy.UsesAdaptiveRssCaching(request);
 
             if (result != null)
             {
-                if (recordStats)
+                if (shouldRecordStats)
                 {
                     var stats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
                     Interlocked.Increment(ref _globalHits);
@@ -165,10 +166,13 @@ namespace NzbDrone.Core.IndexerSearch
                 return null;
             }
 
-            var missStats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
-            Interlocked.Increment(ref _globalMisses);
-            missStats.IncrementMisses();
-            LogStatsIfDue(indexerId, missStats);
+            if (shouldRecordStats)
+            {
+                var missStats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
+                Interlocked.Increment(ref _globalMisses);
+                missStats.IncrementMisses();
+                LogStatsIfDue(indexerId, missStats);
+            }
 
             // Probabilistic sweep of expired keys for this indexer. Fires on every miss
             // when count exceeds threshold, or ~2% of misses otherwise. Ensures abandoned
@@ -183,7 +187,7 @@ namespace NzbDrone.Core.IndexerSearch
             return null;
         }
 
-        public void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null, bool isRssLike = false)
+        public void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null)
         {
             if (indexerName != null)
             {
@@ -192,10 +196,10 @@ namespace NzbDrone.Core.IndexerSearch
 
             var key = GenerateCacheKey(indexerId, request);
 
-            // Track result stability for adaptive TTL only for RSS-like queries.
-            // Non-RSS queries (title/ID searches) are one-off and never use GetAdaptiveTtl,
-            // so tracking them wastes memory and would pollute stability stats.
-            if (isRssLike)
+            // Track result stability only for queries that participate in adaptive TTL.
+            // Explicit cachetime overrides and content-specific searches are excluded
+            // because they do not reuse adaptive stability data.
+            if (NewznabCacheQueryPolicy.UsesAdaptiveRssCaching(request))
             {
                 var fingerprint = ComputeFingerprint(results.Releases);
                 var unchanged = _fingerprints.TryGetValue(key, out var previous) && previous == fingerprint;
