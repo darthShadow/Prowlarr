@@ -52,7 +52,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         {
             for (var i = 0; i < refreshCount; i++)
             {
-                Subject.Set(indexerId, request, MakeResults(3), TimeSpan.FromMinutes(10), isRssLike: true);
+                Subject.Set(indexerId, request, MakeResults(3), TimeSpan.FromMinutes(10));
             }
         }
 
@@ -69,7 +69,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             };
         }
 
-        private long GetIndexerMisses(int indexerId)
+        private object GetIndexerStats(int indexerId)
         {
             var statsField = typeof(NewznabResultsCacheService)
                 .GetField("_indexerStats", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -78,20 +78,44 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
 
             var args = new object[] { indexerId, null };
             var exists = (bool)tryGetValue.Invoke(statsDictionary, args);
-            if (!exists)
+            return exists ? args[1] : null;
+        }
+
+        private long GetIndexerMisses(int indexerId)
+        {
+            var stats = GetIndexerStats(indexerId);
+            if (stats == null)
             {
                 return 0;
             }
 
-            var stats = args[1];
             var missesField = stats.GetType().GetField("_misses", BindingFlags.Instance | BindingFlags.NonPublic);
             return (long)missesField.GetValue(stats);
+        }
+
+        private long GetIndexerHits(int indexerId)
+        {
+            var stats = GetIndexerStats(indexerId);
+            if (stats == null)
+            {
+                return 0;
+            }
+
+            var hitsField = stats.GetType().GetField("_hits", BindingFlags.Instance | BindingFlags.NonPublic);
+            return (long)hitsField.GetValue(stats);
         }
 
         private long GetGlobalHits()
         {
             var field = typeof(NewznabResultsCacheService)
                 .GetField("_globalHits", BindingFlags.Instance | BindingFlags.NonPublic);
+            return (long)field.GetValue(Subject);
+        }
+
+        private long GetGlobalMisses()
+        {
+            var field = typeof(NewznabResultsCacheService)
+                .GetField("_globalMisses", BindingFlags.Instance | BindingFlags.NonPublic);
             return (long)field.GetValue(Subject);
         }
 
@@ -107,7 +131,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             var args = new object[] { key, null };
             if (!(bool)tryGetValue.Invoke(trackers, args))
             {
-                Assert.Fail("MakeTrackerStale: no stability tracker found — ensure Set was called with isRssLike:true before this helper.");
+                Assert.Fail("MakeTrackerStale: no stability tracker found — ensure the request qualifies for adaptive RSS caching before this helper.");
                 return;
             }
 
@@ -133,14 +157,14 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             // Build enough observations for adaptive TTL to engage.
             for (var i = 0; i < 3; i++)
             {
-                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMilliseconds(25), isRssLike: true);
+                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMilliseconds(25));
             }
 
             Thread.Sleep(75);
             Subject.Find(1, req).Should().BeNull("entry should expire to simulate refresh miss");
 
             // Next refresh should continue existing stability history, not restart from zero.
-            Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(10), isRssLike: true);
+            Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(10));
 
             var baseTtl = TimeSpan.FromSeconds(600);
             Subject.GetAdaptiveTtl(1, req, baseTtl).TotalSeconds
@@ -150,7 +174,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         [Test]
         public void FindForRecheck_should_not_record_additional_miss()
         {
-            var req = MakeRequest(q: "recheck-miss");
+            var req = MakeRequest(cat: "5000");
 
             Subject.Find(1, req).Should().BeNull();
             Subject.FindForRecheck(1, req).Should().BeNull();
@@ -161,13 +185,63 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         [Test]
         public void FindForRecheck_hit_should_not_count_stats()
         {
-            var req = MakeRequest(q: "recheck-hit");
+            var req = MakeRequest(cat: "5000");
             Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(10));
 
             var hitsBefore = GetGlobalHits();
             Subject.FindForRecheck(1, req).Should().NotBeNull("cache entry exists");
 
             GetGlobalHits().Should().Be(hitsBefore, "recheck hit must not inflate global hit counter");
+        }
+
+        [Test]
+        public void Find_should_only_count_hits_for_adaptive_rss_queries()
+        {
+            var rssRequest = MakeRequest(cat: "5000");
+            var searchRequest = MakeRequest(q: "specific.title", cat: "5000");
+            var cachetimeRequest = new NewznabRequest { t = "search", cat = "5000", cachetime = 300 };
+
+            Subject.Set(1, rssRequest, MakeResults(3), TimeSpan.FromMinutes(10));
+            Subject.Set(1, searchRequest, MakeResults(3), TimeSpan.FromMinutes(10));
+            Subject.Set(1, cachetimeRequest, MakeResults(3), TimeSpan.FromMinutes(10));
+
+            var indexerHitsBefore = GetIndexerHits(1);
+            var globalHitsBefore = GetGlobalHits();
+
+            Subject.Find(1, rssRequest).Should().NotBeNull("RSS cache entry should exist");
+            Subject.Find(1, searchRequest).Should().NotBeNull("search cache entry should exist");
+            Subject.Find(1, cachetimeRequest).Should().NotBeNull("cachetime cache entry should exist");
+
+            var indexerHitsAfter = GetIndexerHits(1);
+            var globalHitsAfter = GetGlobalHits();
+
+            indexerHitsAfter.Should().Be(indexerHitsBefore + 1,
+                $"expected only the adaptive-RSS hit to be counted, but indexer hits changed from {indexerHitsBefore} to {indexerHitsAfter}");
+            globalHitsAfter.Should().Be(globalHitsBefore + 1,
+                $"expected only the adaptive-RSS hit to be counted globally, but global hits changed from {globalHitsBefore} to {globalHitsAfter}");
+        }
+
+        [Test]
+        public void Find_should_only_count_misses_for_adaptive_rss_queries()
+        {
+            var rssRequest = MakeRequest(cat: "5000");
+            var searchRequest = MakeRequest(q: "specific.title", cat: "5000");
+            var cachetimeRequest = new NewznabRequest { t = "search", cat = "5000", cachetime = 300 };
+
+            var indexerMissesBefore = GetIndexerMisses(1);
+            var globalMissesBefore = GetGlobalMisses();
+
+            Subject.Find(1, rssRequest).Should().BeNull("RSS request should miss on empty cache");
+            Subject.Find(1, searchRequest).Should().BeNull("search request should miss on empty cache");
+            Subject.Find(1, cachetimeRequest).Should().BeNull("cachetime request should miss on empty cache");
+
+            var indexerMissesAfter = GetIndexerMisses(1);
+            var globalMissesAfter = GetGlobalMisses();
+
+            indexerMissesAfter.Should().Be(indexerMissesBefore + 1,
+                $"expected only the adaptive-RSS miss to be counted, but indexer misses changed from {indexerMissesBefore} to {indexerMissesAfter}");
+            globalMissesAfter.Should().Be(globalMissesBefore + 1,
+                $"expected only the adaptive-RSS miss to be counted globally, but global misses changed from {globalMissesBefore} to {globalMissesAfter}");
         }
 
         [Test]
@@ -441,10 +515,10 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         {
             var req = MakeRequest(cat: "5000");
 
-            // Every refresh has different GUIDs (isRssLike=true)
+            // Every refresh has different GUIDs for an adaptive-RSS request
             for (var i = 0; i < 10; i++)
             {
-                Subject.Set(1, req, MakeVolatileResults(i), TimeSpan.FromMinutes(10), isRssLike: true);
+                Subject.Set(1, req, MakeVolatileResults(i), TimeSpan.FromMinutes(10));
             }
 
             var baseTtl = TimeSpan.FromSeconds(600);
@@ -458,7 +532,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             var req = MakeRequest(cat: "5000");
             var baseTtl = TimeSpan.FromSeconds(600);
 
-            // No stability data (isRssLike defaulted to false — not an RSS Set call)
+            // No stability data because no qualifying adaptive-RSS Set call occurred
             var adaptiveTtl = Subject.GetAdaptiveTtl(1, req, baseTtl);
             adaptiveTtl.Should().Be(baseTtl, "no stability data means no extension");
         }
@@ -466,11 +540,11 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         [Test]
         public void GetAdaptiveTtl_should_not_track_non_rss_queries()
         {
-            // Title search: same results every time, but isRssLike=false
+            // Title search: same results every time, but request shape is not adaptive-RSS
             var req = MakeRequest(q: "specific.title", cat: "5000");
             for (var i = 0; i < 10; i++)
             {
-                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(10), isRssLike: false);
+                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(10));
             }
 
             // No stability tracked → adaptive TTL returns base unchanged
@@ -486,7 +560,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
 
             for (var i = 0; i < 10; i++)
             {
-                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(30), isRssLike: true);
+                Subject.Set(1, req, MakeResults(3), TimeSpan.FromMinutes(30));
             }
 
             // 1800s base × ~3.4 multiplier (score 4/5 after decay) = ~6120s, capped at 1800s
@@ -507,7 +581,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             // cat=7000 RSS: volatile
             for (var i = 0; i < 10; i++)
             {
-                Subject.Set(1, rssReq2, MakeVolatileResults(i, "rss2"), TimeSpan.FromMinutes(10), isRssLike: true);
+                Subject.Set(1, rssReq2, MakeVolatileResults(i, "rss2"), TimeSpan.FromMinutes(10));
             }
 
             var baseTtl = TimeSpan.FromSeconds(600);
@@ -557,7 +631,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             // Build stability — 3 identical Sets → score > 0 (unchanged=2, total=3)
             for (var i = 0; i < 3; i++)
             {
-                Subject.Set(1, rssReq, MakeResults(3), TimeSpan.FromMilliseconds(25), isRssLike: true);
+                Subject.Set(1, rssReq, MakeResults(3), TimeSpan.FromMilliseconds(25));
             }
 
             // Flood 51 filler keys to push keys.Count above KeyPruneThreshold (50)
@@ -586,7 +660,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             // Build stability with short TTL
             for (var i = 0; i < 3; i++)
             {
-                Subject.Set(1, rssReq, MakeResults(3), TimeSpan.FromMilliseconds(25), isRssLike: true);
+                Subject.Set(1, rssReq, MakeResults(3), TimeSpan.FromMilliseconds(25));
             }
 
             // Back-date tracker to simulate abandonment (IsStale = true)
@@ -630,7 +704,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
                 {
                     Releases = titles.Select(t => new ReleaseInfo { Title = t }).ToList<ReleaseInfo>()
                 };
-                Subject.Set(1, req, results, TimeSpan.FromMinutes(10), isRssLike: true);
+                Subject.Set(1, req, results, TimeSpan.FromMinutes(10));
             }
 
             var baseTtl = TimeSpan.FromSeconds(600);
@@ -656,7 +730,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
                 {
                     Releases = guids.Select(g => new ReleaseInfo { Title = g, Guid = g }).ToList<ReleaseInfo>()
                 };
-                Subject.Set(1, req, results, TimeSpan.FromMinutes(10), isRssLike: true);
+                Subject.Set(1, req, results, TimeSpan.FromMinutes(10));
             }
 
             var baseTtl = TimeSpan.FromSeconds(600);
@@ -684,7 +758,7 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             // cycle at refresh 15: 1→0; score collapses to 0.
             for (var i = 0; i < 20; i++)
             {
-                Subject.Set(1, req, MakeVolatileResults(i), TimeSpan.FromMinutes(10), isRssLike: true);
+                Subject.Set(1, req, MakeVolatileResults(i), TimeSpan.FromMinutes(10));
             }
 
             Subject.GetAdaptiveTtl(1, req, baseTtl)
