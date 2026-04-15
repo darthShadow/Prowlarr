@@ -188,7 +188,8 @@ namespace NzbDrone.Core.Indexers
 
         protected virtual string GetGuid(XElement item)
         {
-            return item.TryGetValue("guid", Guid.NewGuid().ToString());
+            var guid = item.Element("guid")?.Value;
+            return string.IsNullOrWhiteSpace(guid) ? null : guid;
         }
 
         protected virtual string GetTitle(XElement item)
