@@ -122,6 +122,10 @@ namespace NzbDrone.Core.Indexers
                     {
                         c.Guid = c.InfoUrl;
                     }
+                    else
+                    {
+                        _logger.Warn("Release from indexer {0} has no stable identity after GUID fallback chain: title={1}", Definition.Name, c.Title);
+                    }
                 }
 
                 //Set common props

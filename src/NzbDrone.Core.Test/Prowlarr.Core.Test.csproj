@@ -10,6 +10,7 @@
   <ItemGroup>
     <ProjectReference Include="..\NzbDrone.Test.Common\Prowlarr.Test.Common.csproj" />
     <ProjectReference Include="..\NzbDrone.Core\Prowlarr.Core.csproj" />
+    <ProjectReference Include="..\Prowlarr.Api.V1\Prowlarr.Api.V1.csproj" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\Logo\1024.png">

@@ -4,7 +4,8 @@ namespace NzbDrone.Core.IndexerSearch
 {
     public static class NewznabCacheQueryPolicy
     {
-        private const double BypassProbabilityRss = 0.02;
+        private const double BypassThresholdRatio = 0.5;
+        private const double BypassMaxProbability = 0.25;
 
         /// <summary>
         /// Returns true only for RSS-like queries that use configured TTLs.
@@ -32,14 +33,30 @@ namespace NzbDrone.Core.IndexerSearch
             string.IsNullOrWhiteSpace(request.title) &&
             string.IsNullOrWhiteSpace(request.publisher);
 
-        public static bool ShouldBypassCacheHit(NewznabRequest request, bool atQueryLimit, double? sample = null)
+        public static bool ShouldBypassCacheHit(NewznabRequest request, bool atQueryLimit, double ageRatio, DateTime? bypassSuppressedUntilUtc = null, double? sample = null)
         {
             if (!UsesAdaptiveRssCaching(request) || atQueryLimit)
             {
                 return false;
             }
 
-            return (sample ?? Random.Shared.NextDouble()) < BypassProbabilityRss;
+            if (bypassSuppressedUntilUtc.HasValue && bypassSuppressedUntilUtc.Value > DateTime.UtcNow)
+            {
+                return false;
+            }
+
+            return (sample ?? Random.Shared.NextDouble()) < GetBypassProbability(ageRatio);
+        }
+
+        internal static double GetBypassProbability(double ageRatio)
+        {
+            var clampedAgeRatio = Math.Clamp(ageRatio, 0.0, 1.0);
+            if (clampedAgeRatio <= BypassThresholdRatio)
+            {
+                return 0.0;
+            }
+
+            return ((clampedAgeRatio - BypassThresholdRatio) / (1.0 - BypassThresholdRatio)) * BypassMaxProbability;
         }
     }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -30,17 +31,29 @@ namespace NzbDrone.Core.IndexerSearch
         /// <summary>Returns cached results or null on miss. Updates hit/miss stats only for adaptive-RSS queries.</summary>
         NewznabResults Find(int indexerId, NewznabRequest request);
 
+        /// <summary>Returns cached results using a caller-resolved canonical identity.</summary>
+        NewznabResults Find(CanonicalCacheIdentity identity, NewznabRequest request);
+
+        /// <summary>Returns cached results plus validated metadata using a canonical identity.</summary>
+        CachedEntry FindWithMetadata(CanonicalCacheIdentity identity, NewznabRequest request);
+
         /// <summary>
         /// Returns cached results for post-dedup cache re-check. Does not update hit/miss
         /// stats because the initial lookup was already recorded by Find on the fast path.
         /// </summary>
         NewznabResults FindForRecheck(int indexerId, NewznabRequest request);
 
+        /// <summary>Returns cached results for post-dedup cache re-check using canonical identity.</summary>
+        NewznabResults FindForRecheck(CanonicalCacheIdentity identity);
+
         /// <summary>
         /// Stores results with the given TTL. Releases list is frozen via ReadOnlyCollection.
         /// Stability tracking scope is derived from the request to keep adaptive TTL and stats aligned.
         /// </summary>
         void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null);
+
+        /// <summary>Stores results using a caller-resolved canonical identity.</summary>
+        void Set(CanonicalCacheIdentity identity, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null);
 
         /// <summary>Removes all cached entries and dedup locks for the given indexer.</summary>
         void InvalidateIndexer(int indexerId);
@@ -60,12 +73,24 @@ namespace NzbDrone.Core.IndexerSearch
         /// </summary>
         Task<T> DeduplicateAsync<T>(int indexerId, NewznabRequest request, Func<Task<T>> factory);
 
+        /// <summary>Serializes concurrent requests for the same canonical cache key.</summary>
+        Task<T> DeduplicateAsync<T>(CanonicalCacheIdentity identity, Func<Task<T>> factory);
+
         /// <summary>
         /// Returns an adaptive TTL based on per-key result stability for RSS-like queries.
         /// Caller should only invoke this for RSS-like queries (no content-narrowing params).
         /// Returns baseTtl unchanged if insufficient stability data exists.
         /// </summary>
         TimeSpan GetAdaptiveTtl(int indexerId, NewznabRequest request, TimeSpan baseTtl);
+
+        /// <summary>Returns an adaptive TTL using a caller-resolved canonical identity.</summary>
+        TimeSpan GetAdaptiveTtl(CanonicalCacheIdentity identity, TimeSpan baseTtl);
+
+        /// <summary>Returns the active bypass suppression window for a canonical key, if any.</summary>
+        DateTime? GetBypassSuppressedUntilUtc(CanonicalCacheIdentity identity);
+
+        /// <summary>Records a 30-second bypass suppression window for a canonical key.</summary>
+        bool RecordBypassFailure(CanonicalCacheIdentity identity, DateTime failedAtUtc);
     }
 
     public class NewznabResultsCacheService : INewznabResultsCacheService,
@@ -109,8 +134,10 @@ namespace NzbDrone.Core.IndexerSearch
         // Per-key semaphores for DeduplicateAsync (not disposed on removal — see InvalidateIndexer)
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _keyLocks;
         private readonly ConcurrentDictionary<int, IndexerCacheStats> _indexerStats;
-        private readonly ConcurrentDictionary<string, int> _fingerprints;
+        private readonly ConcurrentDictionary<string, HashSet<string>> _previousGuidSets;
+        private readonly ConcurrentDictionary<string, CachedEntryMetadata> _entryMetadata;
         private readonly ConcurrentDictionary<string, IndexerStabilityTracker> _stabilityTrackers;
+        private readonly ConcurrentDictionary<string, DateTime> _bypassSuppressedUntilUtc;
         private readonly ConcurrentDictionary<int, string> _indexerNames;
         private readonly object _logLock = new();
         private readonly Logger _logger;
@@ -125,8 +152,10 @@ namespace NzbDrone.Core.IndexerSearch
             _indexerKeys = new ConcurrentDictionary<int, ConcurrentDictionary<string, byte>>();
             _keyLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
             _indexerStats = new ConcurrentDictionary<int, IndexerCacheStats>();
-            _fingerprints = new ConcurrentDictionary<string, int>();
+            _previousGuidSets = new ConcurrentDictionary<string, HashSet<string>>();
+            _entryMetadata = new ConcurrentDictionary<string, CachedEntryMetadata>();
             _stabilityTrackers = new ConcurrentDictionary<string, IndexerStabilityTracker>();
+            _bypassSuppressedUntilUtc = new ConcurrentDictionary<string, DateTime>();
             _indexerNames = new ConcurrentDictionary<int, string>();
             _lastGlobalLogTime = DateTime.UtcNow;
             _logger = logger;
@@ -134,78 +163,103 @@ namespace NzbDrone.Core.IndexerSearch
 
         public NewznabResults Find(int indexerId, NewznabRequest request)
         {
-            return FindInternal(indexerId, request, recordStats: true);
+            return FindInternal(indexerId, GenerateCacheKey(indexerId, request), recordStats: true, NewznabCacheQueryPolicy.UsesAdaptiveRssCaching(request));
+        }
+
+        public NewznabResults Find(CanonicalCacheIdentity identity, NewznabRequest request)
+        {
+            return FindInternal(identity.IndexerId, identity.Key, recordStats: true, NewznabCacheQueryPolicy.UsesAdaptiveRssCaching(request));
+        }
+
+        public CachedEntry FindWithMetadata(CanonicalCacheIdentity identity, NewznabRequest request)
+        {
+            return FindWithMetadataInternal(identity.IndexerId, identity.Key, recordStats: true, NewznabCacheQueryPolicy.UsesAdaptiveRssCaching(request));
         }
 
         public NewznabResults FindForRecheck(int indexerId, NewznabRequest request)
         {
-            return FindInternal(indexerId, request, recordStats: false);
+            return FindInternal(indexerId, GenerateCacheKey(indexerId, request), recordStats: false, usesAdaptiveRssCaching: false);
         }
 
-        private NewznabResults FindInternal(int indexerId, NewznabRequest request, bool recordStats)
+        public NewznabResults FindForRecheck(CanonicalCacheIdentity identity)
         {
-            var key = GenerateCacheKey(indexerId, request);
-            var result = _cache.Find(key);
-            var shouldRecordStats = recordStats && NewznabCacheQueryPolicy.UsesAdaptiveRssCaching(request);
+            return FindInternal(identity.IndexerId, identity.Key, recordStats: false, usesAdaptiveRssCaching: false);
+        }
 
+        private NewznabResults FindInternal(int indexerId, string key, bool recordStats, bool usesAdaptiveRssCaching)
+        {
+            var result = _cache.Find(key);
             if (result != null)
             {
-                if (shouldRecordStats)
-                {
-                    var stats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
-                    Interlocked.Increment(ref _globalHits);
-                    stats.IncrementHits();
-                    LogStatsIfDue(indexerId, stats);
-                }
+                RecordCacheHit(indexerId, recordStats, usesAdaptiveRssCaching);
 
                 return result;
             }
 
-            if (!recordStats)
-            {
-                return null;
-            }
-
-            if (shouldRecordStats)
-            {
-                var missStats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
-                Interlocked.Increment(ref _globalMisses);
-                missStats.IncrementMisses();
-                LogStatsIfDue(indexerId, missStats);
-            }
-
-            // Probabilistic sweep of expired keys for this indexer. Fires on every miss
-            // when count exceeds threshold, or ~2% of misses otherwise. Ensures abandoned
-            // RSS keys are eventually reclaimed even on low-volume indexers. Mirrors the
-            // dedup-lock cleanup pattern (see PruneStaleLocks probabilistic trigger).
-            if (_indexerKeys.TryGetValue(indexerId, out var idxKeys)
-                && (idxKeys.Count > KeyPruneThreshold || Random.Shared.Next(50) == 0))
-            {
-                PruneExpiredKeys(indexerId, idxKeys);
-            }
+            RecordCacheMiss(indexerId, recordStats, usesAdaptiveRssCaching);
 
             return null;
         }
 
+        private CachedEntry FindWithMetadataInternal(int indexerId, string key, bool recordStats, bool usesAdaptiveRssCaching)
+        {
+            var result = _cache.Find(key);
+            if (result != null && _entryMetadata.TryGetValue(key, out var metadata))
+            {
+                RecordCacheHit(indexerId, recordStats, usesAdaptiveRssCaching);
+                return new CachedEntry(result, metadata);
+            }
+
+            RecordCacheMiss(indexerId, recordStats, usesAdaptiveRssCaching);
+            return null;
+        }
+
         public void Set(int indexerId, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null)
+        {
+            SetInternal(indexerId, GenerateCacheKey(indexerId, request), request, results, ttl, indexerName);
+        }
+
+        public void Set(CanonicalCacheIdentity identity, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName = null)
+        {
+            SetInternal(identity.IndexerId, identity.Key, request, results, ttl, indexerName);
+        }
+
+        private void SetInternal(int indexerId, string key, NewznabRequest request, NewznabResults results, TimeSpan ttl, string indexerName)
         {
             if (indexerName != null)
             {
                 _indexerNames[indexerId] = indexerName;
             }
 
-            var key = GenerateCacheKey(indexerId, request);
-
             // Track result stability only for queries that participate in adaptive TTL.
             // Explicit cachetime overrides and content-specific searches are excluded
             // because they do not reuse adaptive stability data.
             if (NewznabCacheQueryPolicy.UsesAdaptiveRssCaching(request))
             {
-                var fingerprint = ComputeFingerprint(results.Releases);
-                var unchanged = _fingerprints.TryGetValue(key, out var previous) && previous == fingerprint;
-                _fingerprints[key] = fingerprint;
-                var tracker = _stabilityTrackers.GetOrAdd(key, _ => new IndexerStabilityTracker());
-                tracker.RecordRefresh(unchanged);
+                if (TryBuildIdentitySet(results.Releases, out var currentIdentitySet, out var shouldSkipAdaptiveUpdate))
+                {
+                    var unchanged = false;
+
+                    _previousGuidSets.AddOrUpdate(
+                        key,
+                        currentIdentitySet,
+                        (_, previousIdentitySet) =>
+                        {
+                            unchanged = ComputeJaccardSimilarity(previousIdentitySet, currentIdentitySet) >= 0.9;
+                            return currentIdentitySet;
+                        });
+
+                    var tracker = _stabilityTrackers.GetOrAdd(key, _ => new IndexerStabilityTracker());
+                    tracker.RecordRefresh(unchanged);
+                }
+                else if (shouldSkipAdaptiveUpdate)
+                {
+                    _logger.Warn(
+                        "Skipping adaptive cache identity update for indexer {0}, key {1}: all {2} releases lack guid/title/size",
+                        indexerId,
+                        key,
+                        results.Releases?.Count ?? 0);
+                }
             }
 
             // Freeze the releases list to prevent accidental mutation of cached data
@@ -214,7 +268,7 @@ namespace NzbDrone.Core.IndexerSearch
                 results.Releases = new ReadOnlyCollection<ReleaseInfo>(results.Releases);
             }
 
-            _cache.Set(key, results, ttl);
+            WriteCacheEntryWithMetadata(key, results, ttl);
 
             var keys = _indexerKeys.GetOrAdd(indexerId, _ => new ConcurrentDictionary<string, byte>());
             keys.TryAdd(key, 0);
@@ -224,7 +278,7 @@ namespace NzbDrone.Core.IndexerSearch
             // Only runs when there are enough tracked keys to warrant the scan.
             if (keys.Count > KeyPruneThreshold)
             {
-                PruneExpiredKeys(indexerId, keys);
+                PruneExpiredKeys(indexerId, keys, preserveTracking: true);
             }
 
             _logger.Debug("Cached {0} releases for indexer {1}, TTL {2}s", results.Releases?.Count ?? 0, GetIndexerLabel(indexerId), ttl.TotalSeconds);
@@ -257,8 +311,10 @@ namespace NzbDrone.Core.IndexerSearch
             _cache.Clear();
             _indexerKeys.Clear();
             _keyLocks.Clear();
-            _fingerprints.Clear();
+            _previousGuidSets.Clear();
+            _entryMetadata.Clear();
             _stabilityTrackers.Clear();
+            _bypassSuppressedUntilUtc.Clear();
             _indexerStats.Clear();
             _indexerNames.Clear();
 
@@ -315,8 +371,50 @@ namespace NzbDrone.Core.IndexerSearch
         /// </summary>
         public TimeSpan GetAdaptiveTtl(int indexerId, NewznabRequest request, TimeSpan baseTtl)
         {
-            var key = GenerateCacheKey(indexerId, request);
+            return GetAdaptiveTtl(indexerId, GenerateCacheKey(indexerId, request), baseTtl);
+        }
 
+        public TimeSpan GetAdaptiveTtl(CanonicalCacheIdentity identity, TimeSpan baseTtl)
+        {
+            return GetAdaptiveTtl(identity.IndexerId, identity.Key, baseTtl);
+        }
+
+        public DateTime? GetBypassSuppressedUntilUtc(CanonicalCacheIdentity identity)
+        {
+            if (!_bypassSuppressedUntilUtc.TryGetValue(identity.Key, out var suppressedUntilUtc))
+            {
+                return null;
+            }
+
+            if (suppressedUntilUtc <= DateTime.UtcNow)
+            {
+                return null;
+            }
+
+            return suppressedUntilUtc;
+        }
+
+        public bool RecordBypassFailure(CanonicalCacheIdentity identity, DateTime failedAtUtc)
+        {
+            if (failedAtUtc.Kind != DateTimeKind.Utc)
+            {
+                throw new ArgumentException("Bypass suppression timestamps must be UTC.", nameof(failedAtUtc));
+            }
+
+            try
+            {
+                _bypassSuppressedUntilUtc[identity.Key] = failedAtUtc + TimeSpan.FromSeconds(30);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(ex, "Failed to record bypass suppression for cache key {0}", identity.Key);
+                return false;
+            }
+        }
+
+        private TimeSpan GetAdaptiveTtl(int indexerId, string key, TimeSpan baseTtl)
+        {
             if (_stabilityTrackers.TryGetValue(key, out var tracker))
             {
                 var score = tracker.GetStabilityScore();
@@ -347,6 +445,16 @@ namespace NzbDrone.Core.IndexerSearch
         /// </summary>
         public async Task<T> DeduplicateAsync<T>(int indexerId, NewznabRequest request, Func<Task<T>> factory)
         {
+            return await DeduplicateAsync(GenerateCacheKey(indexerId, request), factory);
+        }
+
+        public async Task<T> DeduplicateAsync<T>(CanonicalCacheIdentity identity, Func<Task<T>> factory)
+        {
+            return await DeduplicateAsync(identity.Key, factory);
+        }
+
+        private async Task<T> DeduplicateAsync<T>(string key, Func<Task<T>> factory)
+        {
             // Probabilistic cleanup: ~2% of requests trigger a bounded scan of _keyLocks,
             // removing unheld semaphores to prevent growth from one-off title searches.
             // Hard cap: full scan (no batch limit) if count exceeds MaxDedupLocks.
@@ -359,7 +467,6 @@ namespace NzbDrone.Core.IndexerSearch
                 PruneStaleLocks();
             }
 
-            var key = GenerateCacheKey(indexerId, request);
             var semaphore = _keyLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
 
             await semaphore.WaitAsync();
@@ -449,10 +556,16 @@ namespace NzbDrone.Core.IndexerSearch
         private string GetIndexerLabel(int indexerId) =>
             _indexerNames.TryGetValue(indexerId, out var name) ? $"{name} ({indexerId})" : indexerId.ToString();
 
-        private void CleanupKeyTracking(string key)
+        private void CleanupKeyTracking(string key, bool preserveTracking = false)
         {
-            _fingerprints.TryRemove(key, out _);
-            _stabilityTrackers.TryRemove(key, out _);
+            if (!preserveTracking)
+            {
+                _previousGuidSets.TryRemove(key, out _);
+                _stabilityTrackers.TryRemove(key, out _);
+            }
+
+            _entryMetadata.TryRemove(key, out _);
+            _bypassSuppressedUntilUtc.TryRemove(key, out _);
         }
 
         private void PruneKey(int indexerId, string key)
@@ -469,7 +582,7 @@ namespace NzbDrone.Core.IndexerSearch
         /// Scans tracked keys for an indexer and removes any whose cache entries have expired.
         /// Called opportunistically from Set() to amortize cleanup without a background timer.
         /// </summary>
-        private void PruneExpiredKeys(int indexerId, ConcurrentDictionary<string, byte> keys)
+        private void PruneExpiredKeys(int indexerId, ConcurrentDictionary<string, byte> keys, bool preserveTracking)
         {
             var pruned = 0;
 
@@ -477,16 +590,20 @@ namespace NzbDrone.Core.IndexerSearch
             {
                 if (_cache.Find(trackedKey) == null)
                 {
+                    // Accepted exception: _cache.Find may inline-evict expired entries before the
+                    // parallel metadata/suppression state is reaped here.
                     // Preserve recent stability data for RSS-like keys across cache expiry.
                     // Keep key in _indexerKeys so future prune cycles and InvalidateIndexer
                     // can find and clean it up. Stale trackers are cleaned up normally.
-                    var preserveTracking = _stabilityTrackers.TryGetValue(trackedKey, out var tracker)
-                                           && !tracker.IsStale(StabilityRetentionWindow);
+                    var keepTracking = preserveTracking
+                        && _stabilityTrackers.TryGetValue(trackedKey, out var tracker)
+                        && !tracker.IsStale(StabilityRetentionWindow);
 
-                    if (!preserveTracking)
+                    CleanupKeyTracking(trackedKey, preserveTracking: keepTracking);
+
+                    if (!keepTracking)
                     {
                         keys.TryRemove(trackedKey, out _);
-                        CleanupKeyTracking(trackedKey);
                         pruned++;
                     }
                 }
@@ -495,6 +612,63 @@ namespace NzbDrone.Core.IndexerSearch
             if (pruned > 0)
             {
                 _logger.Debug("Pruned {0} expired keys for indexer {1}, {2} remaining", pruned, GetIndexerLabel(indexerId), keys.Count);
+            }
+        }
+
+        private void RecordCacheHit(int indexerId, bool recordStats, bool usesAdaptiveRssCaching)
+        {
+            if (!recordStats || !usesAdaptiveRssCaching)
+            {
+                return;
+            }
+
+            var stats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
+            Interlocked.Increment(ref _globalHits);
+            stats.IncrementHits();
+            LogStatsIfDue(indexerId, stats);
+        }
+
+        private void RecordCacheMiss(int indexerId, bool recordStats, bool usesAdaptiveRssCaching)
+        {
+            if (recordStats && usesAdaptiveRssCaching)
+            {
+                var missStats = _indexerStats.GetOrAdd(indexerId, _ => new IndexerCacheStats());
+                Interlocked.Increment(ref _globalMisses);
+                missStats.IncrementMisses();
+                LogStatsIfDue(indexerId, missStats);
+            }
+
+            if (!recordStats)
+            {
+                return;
+            }
+
+            // Probabilistic sweep of expired keys for this indexer. Fires on every miss
+            // when count exceeds threshold, or ~2% of misses otherwise. Ensures abandoned
+            // RSS keys are eventually reclaimed even on low-volume indexers. Mirrors the
+            // dedup-lock cleanup pattern (see PruneStaleLocks probabilistic trigger).
+            if (_indexerKeys.TryGetValue(indexerId, out var idxKeys)
+                && (idxKeys.Count > KeyPruneThreshold || Random.Shared.Next(50) == 0))
+            {
+                PruneExpiredKeys(indexerId, idxKeys, preserveTracking: true);
+            }
+        }
+
+        private void WriteCacheEntryWithMetadata(string key, NewznabResults results, TimeSpan ttl)
+        {
+            // Non-positive TTL is a caller bug; preserve CachedEntryMetadata validation.
+            var metadata = new CachedEntryMetadata(DateTime.UtcNow, (int)Math.Ceiling(ttl.TotalSeconds));
+
+            _cache.Set(key, results, ttl);
+
+            try
+            {
+                _entryMetadata[key] = metadata;
+            }
+            catch
+            {
+                _cache.Remove(key);
+                throw;
             }
         }
 
@@ -662,47 +836,61 @@ namespace NzbDrone.Core.IndexerSearch
             }
         }
 
-        /// <summary>
-        /// Computes a hash fingerprint to detect result changes. Order-independent:
-        /// GUIDs (or titles when no GUIDs) are sorted before hashing so {A,B} and
-        /// {B,A} produce the same fingerprint. Seeded with count so size changes are
-        /// always detected, even when all GUIDs are null.
-        /// </summary>
-        private static int ComputeFingerprint(IList<ReleaseInfo> releases)
+        private static bool TryBuildIdentitySet(IList<ReleaseInfo> releases, out HashSet<string> identitySet, out bool shouldSkipAdaptiveUpdate)
         {
             if (releases == null || releases.Count == 0)
             {
-                return 0;
+                identitySet = new HashSet<string>(StringComparer.Ordinal);
+                shouldSkipAdaptiveUpdate = false;
+                return true;
             }
 
-            var hash = default(HashCode);
+            var guidIdentitySet = releases
+                .Select(release => release.Guid)
+                .Where(guid => !string.IsNullOrWhiteSpace(guid))
+                .ToHashSet(StringComparer.Ordinal);
 
-            // Seed with count so size changes are detected even when GUIDs are null
-            hash.Add(releases.Count);
-
-            var hasGuids = false;
-            foreach (var guid in releases
-                .Select(r => r.Guid)
-                .Where(g => g != null)
-                .OrderBy(g => g, StringComparer.Ordinal))
+            if (guidIdentitySet.Count > 0)
             {
-                hash.Add(guid);
-                hasGuids = true;
+                identitySet = guidIdentitySet;
+                shouldSkipAdaptiveUpdate = false;
+                return true;
             }
 
-            // Fallback: hash sorted titles when no GUIDs are available (some indexers omit them)
-            if (!hasGuids)
+            identitySet = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var release in releases)
             {
-                foreach (var title in releases
-                    .Select(r => r.Title)
-                    .Where(t => t != null)
-                    .OrderBy(t => t, StringComparer.Ordinal))
+                var normalizedTitle = string.IsNullOrWhiteSpace(release.Title) ? null : release.Title;
+
+                if (normalizedTitle == null && !release.Size.HasValue)
                 {
-                    hash.Add(title);
+                    continue;
                 }
+
+                identitySet.Add($"{normalizedTitle ?? string.Empty}{KeyDelimiter}{release.Size?.ToString(CultureInfo.InvariantCulture) ?? string.Empty}");
             }
 
-            return hash.ToHashCode();
+            shouldSkipAdaptiveUpdate = identitySet.Count == 0;
+            return !shouldSkipAdaptiveUpdate;
+        }
+
+        private static double ComputeJaccardSimilarity(HashSet<string> previousIdentitySet, HashSet<string> currentIdentitySet)
+        {
+            if (previousIdentitySet.Count == 0 && currentIdentitySet.Count == 0)
+            {
+                return 1.0;
+            }
+
+            if (previousIdentitySet.Count == 0 || currentIdentitySet.Count == 0)
+            {
+                return 0.0;
+            }
+
+            var intersectionCount = previousIdentitySet.Count(identity => currentIdentitySet.Contains(identity));
+            var unionCount = previousIdentitySet.Count + currentIdentitySet.Count - intersectionCount;
+
+            return unionCount == 0 ? 1.0 : (double)intersectionCount / unionCount;
         }
 
         /// <summary>

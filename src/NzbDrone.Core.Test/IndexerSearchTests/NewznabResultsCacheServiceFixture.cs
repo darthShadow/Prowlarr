@@ -1,17 +1,26 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using FluentAssertions;
+using NLog;
+using NLog.Config;
+using NLog.Targets;
 using NUnit.Framework;
+using NzbDrone.Api.V1.Indexers;
+using NzbDrone.Common.Cache;
+using NzbDrone.Common.Http;
 using NzbDrone.Core.Configuration;
 using NzbDrone.Core.Indexers;
 using NzbDrone.Core.IndexerSearch;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.Test.Framework;
 using NzbDrone.Core.ThingiProvider.Events;
+using NzbDrone.Test.Common;
 
 namespace NzbDrone.Core.Test.IndexerSearchTests
 {
@@ -69,6 +78,27 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             };
         }
 
+        private static NewznabResults MakeGuidResults(IEnumerable<string> guids)
+        {
+            return new NewznabResults
+            {
+                Releases = guids.Select(guid => (ReleaseInfo)new ReleaseInfo { Guid = guid, Title = guid }).ToList()
+            };
+        }
+
+        private static NewznabResults MakeConsecutiveGuidResults(int start, int count)
+        {
+            return MakeGuidResults(Enumerable.Range(start, count).Select(i => $"guid-{i}"));
+        }
+
+        private static NewznabResults MakeTitleSizeResults(params (string Title, long? Size)[] entries)
+        {
+            return new NewznabResults
+            {
+                Releases = entries.Select(entry => (ReleaseInfo)new ReleaseInfo { Title = entry.Title, Size = entry.Size }).ToList()
+            };
+        }
+
         private object GetIndexerStats(int indexerId)
         {
             var statsField = typeof(NewznabResultsCacheService)
@@ -110,6 +140,93 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             var field = typeof(NewznabResultsCacheService)
                 .GetField("_globalHits", BindingFlags.Instance | BindingFlags.NonPublic);
             return (long)field.GetValue(Subject);
+        }
+
+        private CanonicalCacheIdentity ResolveIdentity(int indexerId, NewznabRequest request, IndexerCapabilities capabilities = null)
+        {
+            return Mocker.Resolve<NewznabCacheIdentityResolver>()
+                .Resolve(indexerId, request, capabilities ?? new IndexerCapabilities());
+        }
+
+        private ConcurrentDictionary<string, T> GetStringDictionary<T>(string fieldName)
+        {
+            var field = typeof(NewznabResultsCacheService)
+                .GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+
+            return (ConcurrentDictionary<string, T>)field.GetValue(Subject);
+        }
+
+        private ConcurrentDictionary<int, ConcurrentDictionary<string, byte>> GetIndexerKeys()
+        {
+            var field = typeof(NewznabResultsCacheService)
+                .GetField("_indexerKeys", BindingFlags.Instance | BindingFlags.NonPublic);
+
+            return (ConcurrentDictionary<int, ConcurrentDictionary<string, byte>>)field.GetValue(Subject);
+        }
+
+        private (long Unchanged, long Total) GetStabilityTrackerCounts(string key)
+        {
+            var trackersField = typeof(NewznabResultsCacheService)
+                .GetField("_stabilityTrackers", BindingFlags.Instance | BindingFlags.NonPublic);
+            var trackers = trackersField.GetValue(Subject);
+            var tryGetValue = trackers.GetType().GetMethod("TryGetValue");
+            var args = new object[] { key, null };
+
+            ((bool)tryGetValue.Invoke(trackers, args)).Should().BeTrue("stability tracker should exist for the canonical key");
+
+            var tracker = args[1];
+            var unchangedField = tracker.GetType().GetField("_unchangedRefreshes", BindingFlags.Instance | BindingFlags.NonPublic);
+            var totalField = tracker.GetType().GetField("_totalRefreshes", BindingFlags.Instance | BindingFlags.NonPublic);
+
+            return ((long)unchangedField.GetValue(tracker), (long)totalField.GetValue(tracker));
+        }
+
+        private ICached<NewznabResults> GetCacheStore()
+        {
+            var field = typeof(NewznabResultsCacheService)
+                .GetField("_cache", BindingFlags.Instance | BindingFlags.NonPublic);
+
+            return (ICached<NewznabResults>)field.GetValue(Subject);
+        }
+
+        private void InvokeCleanupKeyTracking(string key, bool preserveTracking = false)
+        {
+            var method = typeof(NewznabResultsCacheService)
+                .GetMethod("CleanupKeyTracking", BindingFlags.Instance | BindingFlags.NonPublic);
+
+            method.Invoke(Subject, new object[] { key, preserveTracking });
+        }
+
+        private void InvokePruneExpiredKeys(int indexerId, bool preserveTracking)
+        {
+            var method = typeof(NewznabResultsCacheService)
+                .GetMethod("PruneExpiredKeys", BindingFlags.Instance | BindingFlags.NonPublic);
+
+            method.Invoke(Subject, new object[] { indexerId, GetIndexerKeys()[indexerId], preserveTracking });
+        }
+
+        private void PopulateAdjunctState(int indexerId, NewznabRequest request, TimeSpan ttl)
+        {
+            var identity = ResolveIdentity(indexerId, request);
+            Subject.Set(identity, request, MakeResults(3), ttl, "Indexer");
+            Subject.RecordBypassFailure(identity, DateTime.UtcNow);
+        }
+
+        private bool PrivateDictionaryContainsKey(string fieldName, string key)
+        {
+            var field = typeof(NewznabResultsCacheService)
+                .GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+            var dictionary = field.GetValue(Subject);
+            var containsKey = dictionary.GetType().GetMethod("ContainsKey");
+
+            return (bool)containsKey.Invoke(dictionary, new object[] { key });
+        }
+
+        private void AssertAdjunctStateRemoved(string key, bool previousGuidSetsRemoved)
+        {
+            GetStringDictionary<CachedEntryMetadata>("_entryMetadata").ContainsKey(key).Should().BeFalse();
+            GetStringDictionary<DateTime>("_bypassSuppressedUntilUtc").ContainsKey(key).Should().BeFalse();
+            GetStringDictionary<HashSet<string>>("_previousGuidSets").ContainsKey(key).Should().Be(!previousGuidSetsRemoved);
         }
 
         private long GetGlobalMisses()
@@ -258,6 +375,95 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         }
 
         [Test]
+        public void FindWithMetadata_should_return_cached_entry_when_metadata_matches()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            Subject.Set(identity, request, MakeResults(3), TimeSpan.FromMinutes(10), "Indexer");
+
+            var cachedEntry = Subject.FindWithMetadata(identity, request);
+
+            cachedEntry.Should().NotBeNull();
+            cachedEntry.Results.Releases.Count.Should().Be(3);
+            cachedEntry.Metadata.CachedTtlSecs.Should().Be(600);
+            cachedEntry.Metadata.CachedAtUtc.Kind.Should().Be(DateTimeKind.Utc);
+        }
+
+        [Test]
+        public void FindWithMetadata_should_return_null_when_cache_entry_exists_but_metadata_is_missing()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            Subject.Set(identity, request, MakeResults(3), TimeSpan.FromMinutes(10), "Indexer");
+
+            GetStringDictionary<CachedEntryMetadata>("_entryMetadata").TryRemove(identity.Key, out _);
+
+            Subject.FindWithMetadata(identity, request).Should().BeNull();
+        }
+
+        [Test]
+        public void FindWithMetadata_should_return_null_when_metadata_exists_but_cache_entry_is_missing()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            Subject.Set(identity, request, MakeResults(3), TimeSpan.FromMinutes(10), "Indexer");
+
+            GetCacheStore().Remove(identity.Key);
+
+            Subject.FindWithMetadata(identity, request).Should().BeNull();
+        }
+
+        [Test]
+        public void CachedEntryMetadata_should_require_utc_timestamp()
+        {
+            Assert.Throws<ArgumentException>(() => new CachedEntryMetadata(DateTime.Now, 600));
+        }
+
+        [Test]
+        public void CachedEntryMetadata_should_require_positive_ttl()
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() => new CachedEntryMetadata(DateTime.UtcNow, 0));
+        }
+
+        [Test]
+        public void Set_should_reject_non_positive_ttl()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                Subject.Set(identity, request, MakeResults(1), TimeSpan.Zero, "Indexer"));
+            Subject.FindWithMetadata(identity, request).Should().BeNull();
+        }
+
+        [Test]
+        public void RecordBypassFailure_should_create_30_second_cooldown()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            var now = DateTime.UtcNow;
+
+            Subject.RecordBypassFailure(identity, now).Should().BeTrue();
+
+            var suppressedUntilUtc = Subject.GetBypassSuppressedUntilUtc(identity);
+
+            suppressedUntilUtc.Should().NotBeNull();
+            suppressedUntilUtc.Value.Should().BeOnOrAfter(now.AddSeconds(29));
+            suppressedUntilUtc.Value.Should().BeOnOrBefore(now.AddSeconds(31));
+        }
+
+        [Test]
+        public void GetBypassSuppressedUntilUtc_should_ignore_expired_cooldown_without_removing_it()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            Subject.RecordBypassFailure(identity, DateTime.UtcNow.AddSeconds(-31)).Should().BeTrue();
+
+            Subject.GetBypassSuppressedUntilUtc(identity).Should().BeNull();
+            GetStringDictionary<DateTime>("_bypassSuppressedUntilUtc").ContainsKey(identity.Key).Should().BeTrue();
+        }
+
+        [Test]
         public void InvalidateIndexer_should_remove_entries_for_that_indexer_only()
         {
             var reqA = MakeRequest(q: "alpha");
@@ -288,54 +494,55 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
 
         // ── Cache key ──────────────────────────────────────────────────────────
         [Test]
-        public void GenerateCacheKey_should_be_deterministic()
+        public void ResolveCacheIdentity_should_be_deterministic()
         {
             var req = MakeRequest(q: "test");
-            var key1 = NewznabResultsCacheService.GenerateCacheKey(1, req);
-            var key2 = NewznabResultsCacheService.GenerateCacheKey(1, req);
+            var key1 = ResolveIdentity(1, req).Key;
+            var key2 = ResolveIdentity(1, req).Key;
             key1.Should().Be(key2);
         }
 
         [Test]
-        public void GenerateCacheKey_should_differ_on_different_params()
+        public void ResolveCacheIdentity_should_differ_on_different_params()
         {
-            var key1 = NewznabResultsCacheService.GenerateCacheKey(1, MakeRequest(q: "foo"));
-            var key2 = NewznabResultsCacheService.GenerateCacheKey(1, MakeRequest(q: "bar"));
+            var key1 = ResolveIdentity(1, MakeRequest(q: "foo")).Key;
+            var key2 = ResolveIdentity(1, MakeRequest(q: "bar")).Key;
             key1.Should().NotBe(key2);
         }
 
         [Test]
-        public void GenerateCacheKey_should_differ_on_different_extended()
+        public void ResolveCacheIdentity_should_collapse_different_extended()
         {
-            var key1 = NewznabResultsCacheService.GenerateCacheKey(1, MakeRequest(extended: "1"));
-            var key2 = NewznabResultsCacheService.GenerateCacheKey(1, MakeRequest(extended: null));
-            key1.Should().NotBe(key2);
+            var key1 = ResolveIdentity(1, MakeRequest(extended: "1")).Key;
+            var key2 = ResolveIdentity(1, MakeRequest(extended: null)).Key;
+            key1.Should().Be(key2);
         }
 
         [Test]
-        public void GenerateCacheKey_should_normalize_cat_order()
+        public void ResolveCacheIdentity_should_normalize_cat_order()
         {
-            var key1 = NewznabResultsCacheService.GenerateCacheKey(1, new NewznabRequest { t = "search", cat = "5000,2000" });
-            var key2 = NewznabResultsCacheService.GenerateCacheKey(1, new NewznabRequest { t = "search", cat = "2000,5000" });
+            var key1 = ResolveIdentity(1, new NewznabRequest { t = "search", cat = "5000,2000" }).Key;
+            var key2 = ResolveIdentity(1, new NewznabRequest { t = "search", cat = "2000,5000" }).Key;
             key1.Should().Be(key2, "category order should not affect cache key");
         }
 
         [Test]
-        public void GenerateCacheKey_should_normalize_q_whitespace()
+        public void ResolveCacheIdentity_should_preserve_q_whitespace()
         {
-            var key1 = NewznabResultsCacheService.GenerateCacheKey(1, new NewznabRequest { t = "search", q = "test" });
-            var key2 = NewznabResultsCacheService.GenerateCacheKey(1, new NewznabRequest { t = "search", q = " test " });
-            key1.Should().Be(key2, "whitespace around q should not affect cache key");
+            var key1 = ResolveIdentity(1, new NewznabRequest { t = "search", q = "test" }).Key;
+            var key2 = ResolveIdentity(1, new NewznabRequest { t = "search", q = " test " }).Key;
+            key1.Should().NotBe(key2, "canonical q must be preserved as-is, including leading and trailing whitespace");
+            key2.Should().Contain("q= test ", "the canonical key should keep q exactly as supplied");
         }
 
         [Test]
-        public void GenerateCacheKey_should_exclude_volatile_fields()
+        public void ResolveCacheIdentity_should_exclude_volatile_fields()
         {
             var req1 = new NewznabRequest { t = "search", q = "test", source = "a", host = "x", server = "s1", configured = "1", cachetime = 300 };
             var req2 = new NewznabRequest { t = "search", q = "test", source = "b", host = "y", server = "s2", configured = "0", cachetime = 600 };
 
-            var key1 = NewznabResultsCacheService.GenerateCacheKey(1, req1);
-            var key2 = NewznabResultsCacheService.GenerateCacheKey(1, req2);
+            var key1 = ResolveIdentity(1, req1).Key;
+            var key2 = ResolveIdentity(1, req2).Key;
             key1.Should().Be(key2, "source, host, server, configured, cachetime are volatile/meta and excluded from the cache key");
         }
 
@@ -515,7 +722,8 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         {
             var req = MakeRequest(cat: "5000");
 
-            // Every refresh has different GUIDs for an adaptive-RSS request
+            // Every refresh has different GUIDs for an adaptive-RSS request,
+            // so Jaccard similarity stays at 0 and the tracker never records unchanged=true.
             for (var i = 0; i < 10; i++)
             {
                 Subject.Set(1, req, MakeVolatileResults(i), TimeSpan.FromMinutes(10));
@@ -524,6 +732,111 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
             var baseTtl = TimeSpan.FromSeconds(600);
             var adaptiveTtl = Subject.GetAdaptiveTtl(1, req, baseTtl);
             adaptiveTtl.Should().Be(baseTtl, "volatile results should not extend TTL");
+        }
+
+        [Test]
+        public void GetAdaptiveTtl_should_extend_when_jaccard_exceeds_threshold()
+        {
+            var req = MakeRequest(cat: "5000");
+            var baseline = Enumerable.Range(1, 100).Select(i => $"guid-{i}").ToArray();
+            var shifted = Enumerable.Range(6, 100).Select(i => $"guid-{i}").ToArray(); // 95 overlap => 95 / 105 > 0.9
+
+            Subject.Set(1, req, MakeGuidResults(baseline), TimeSpan.FromMinutes(10));
+            Subject.Set(1, req, MakeGuidResults(shifted), TimeSpan.FromMinutes(10));
+            Subject.Set(1, req, MakeGuidResults(baseline), TimeSpan.FromMinutes(10));
+
+            Subject.GetAdaptiveTtl(1, req, TimeSpan.FromSeconds(600)).TotalSeconds
+                .Should().BeGreaterThan(600, "95% overlap across refreshes should count as unchanged");
+        }
+
+        [Test]
+        public void GetAdaptiveTtl_should_not_extend_when_jaccard_stays_below_threshold()
+        {
+            var req = MakeRequest(cat: "5000");
+            var baseline = Enumerable.Range(1, 100).Select(i => $"guid-{i}").ToArray();
+            var shifted = Enumerable.Range(7, 100).Select(i => $"guid-{i}").ToArray(); // 94 overlap => 94 / 106 < 0.9
+
+            Subject.Set(1, req, MakeGuidResults(baseline), TimeSpan.FromMinutes(10));
+            Subject.Set(1, req, MakeGuidResults(shifted), TimeSpan.FromMinutes(10));
+            Subject.Set(1, req, MakeGuidResults(baseline), TimeSpan.FromMinutes(10));
+
+            Subject.GetAdaptiveTtl(1, req, TimeSpan.FromSeconds(600))
+                .Should().Be(TimeSpan.FromSeconds(600), "94% overlap should remain below the 0.9 Jaccard threshold");
+        }
+
+        [TestCase(90, 10, 0, false, TestName = "Jaccard_exactly_0_8_should_record_changed")]
+        [TestCase(95, 5, 2, true, TestName = "Jaccard_exactly_0_9_should_record_stable")]
+        [TestCase(100, 5, 2, true, TestName = "Jaccard_above_0_9_should_record_stable")]
+        public void GetAdaptiveTtl_should_respect_jaccard_threshold_boundaries(int setSize, int shift, int expectedUnchangedRefreshes, bool shouldExtend)
+        {
+            var req = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, req);
+
+            Subject.Set(identity, req, MakeConsecutiveGuidResults(1, setSize), TimeSpan.FromMinutes(10));
+            Subject.Set(identity, req, MakeConsecutiveGuidResults(1 + shift, setSize), TimeSpan.FromMinutes(10));
+            Subject.Set(identity, req, MakeConsecutiveGuidResults(1 + (shift * 2), setSize), TimeSpan.FromMinutes(10));
+
+            var trackerCounts = GetStabilityTrackerCounts(identity.Key);
+            trackerCounts.Unchanged.Should().Be(expectedUnchangedRefreshes);
+            trackerCounts.Total.Should().Be(3);
+
+            var adaptiveTtl = Subject.GetAdaptiveTtl(identity, TimeSpan.FromSeconds(600));
+            if (shouldExtend)
+            {
+                adaptiveTtl.TotalSeconds.Should().BeGreaterThan(600);
+            }
+            else
+            {
+                adaptiveTtl.Should().Be(TimeSpan.FromSeconds(600));
+            }
+        }
+
+        [Test]
+        public void GetAdaptiveTtl_should_ignore_no_guid_tuple_changes_when_any_guid_is_present()
+        {
+            var req = MakeRequest(cat: "5000");
+
+            Subject.Set(
+                1,
+                req,
+                new NewznabResults
+                {
+                    Releases = new List<ReleaseInfo>
+                    {
+                        new ReleaseInfo { Guid = "guid-1", Title = "Release 1" },
+                        new ReleaseInfo { Title = "Tuple A", Size = 1000 }
+                    }
+                },
+                TimeSpan.FromMinutes(10));
+
+            Subject.Set(
+                1,
+                req,
+                new NewznabResults
+                {
+                    Releases = new List<ReleaseInfo>
+                    {
+                        new ReleaseInfo { Guid = "guid-1", Title = "Release 1" },
+                        new ReleaseInfo { Title = "Tuple B", Size = 2000 }
+                    }
+                },
+                TimeSpan.FromMinutes(10));
+
+            Subject.Set(
+                1,
+                req,
+                new NewznabResults
+                {
+                    Releases = new List<ReleaseInfo>
+                    {
+                        new ReleaseInfo { Guid = "guid-1", Title = "Release 1" },
+                        new ReleaseInfo { Title = "Tuple C", Size = 3000 }
+                    }
+                },
+                TimeSpan.FromMinutes(10));
+
+            Subject.GetAdaptiveTtl(1, req, TimeSpan.FromSeconds(600)).TotalSeconds
+                .Should().BeGreaterThan(600, "when any GUID exists, no-GUID tuple-only releases must not affect identity comparison");
         }
 
         [Test]
@@ -685,10 +998,6 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
         }
 
         // ── Fingerprint edge cases ────────────────────────────────────────────
-
-        // Verifies count-seed + title fallback: two null-GUID sets with different
-        // titles but identical count must produce distinct fingerprints and be
-        // detected as volatile (score stays 0 → adaptive TTL returns base).
         [Test]
         public void GetAdaptiveTtl_should_detect_change_when_all_guids_null()
         {
@@ -702,14 +1011,36 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
 
                 var results = new NewznabResults
                 {
-                    Releases = titles.Select(t => new ReleaseInfo { Title = t }).ToList<ReleaseInfo>()
+                    Releases = titles.Select((title, index) => new ReleaseInfo { Title = title, Size = 1000 + index }).ToList<ReleaseInfo>()
                 };
                 Subject.Set(1, req, results, TimeSpan.FromMinutes(10));
             }
 
             var baseTtl = TimeSpan.FromSeconds(600);
             Subject.GetAdaptiveTtl(1, req, baseTtl)
-                .Should().Be(baseTtl, "alternating null-GUID sets with distinct titles should be volatile");
+                .Should().Be(baseTtl, "alternating null-GUID title/size tuples should be volatile");
+        }
+
+        [Test]
+        public void Set_should_skip_adaptive_update_and_warn_when_all_release_identity_fields_are_missing()
+        {
+            var req = MakeRequest(cat: "5000");
+            var key = ResolveIdentity(1, req).Key;
+            var results = new NewznabResults
+            {
+                Releases = new List<ReleaseInfo>
+                {
+                    new ReleaseInfo(),
+                    new ReleaseInfo()
+                }
+            };
+
+            Subject.Set(1, req, results, TimeSpan.FromMinutes(10));
+
+            Subject.GetAdaptiveTtl(1, req, TimeSpan.FromSeconds(600))
+                .Should().Be(TimeSpan.FromSeconds(600));
+            GetStringDictionary<HashSet<string>>("_previousGuidSets").ContainsKey(key).Should().BeFalse();
+            ExceptionVerification.ExpectedWarns(1);
         }
 
         // Verifies GUIDs are sorted before hashing: [a,b,c] and [c,b,a] must
@@ -763,6 +1094,308 @@ namespace NzbDrone.Core.Test.IndexerSearchTests
 
             Subject.GetAdaptiveTtl(1, req, baseTtl)
                 .Should().Be(baseTtl, "stability must decay to zero after sustained volatile period");
+        }
+
+        [Test]
+        public void WriteCacheEntryWithMetadata_should_expose_consistent_pairs_under_concurrent_reads()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            Subject.Set(identity, request, MakeGuidResults(new[] { "old-guid" }), TimeSpan.FromMinutes(10), "Indexer");
+
+            var stop = false;
+            var mismatchedReads = 0;
+            var reader = Task.Run(() =>
+            {
+                while (!Volatile.Read(ref stop))
+                {
+                    var cachedEntry = Subject.FindWithMetadata(identity, request);
+                    if (cachedEntry == null)
+                    {
+                        continue;
+                    }
+
+                    var guid = cachedEntry.Results.Releases.Single().Guid;
+                    var ttlSecs = cachedEntry.Metadata.CachedTtlSecs;
+
+                    if ((guid == "old-guid" && ttlSecs != 600) ||
+                        (guid == "new-guid" && ttlSecs != 1200))
+                    {
+                        Interlocked.Increment(ref mismatchedReads);
+                    }
+                }
+            });
+
+            Subject.Set(identity, request, MakeGuidResults(new[] { "new-guid" }), TimeSpan.FromMinutes(20), "Indexer");
+            Volatile.Write(ref stop, true);
+            reader.Wait(TimeSpan.FromSeconds(5));
+
+            mismatchedReads.Should().Be(0, "FindWithMetadata should never mix a result snapshot with the wrong metadata snapshot");
+
+            var finalRead = Subject.FindWithMetadata(identity, request);
+            finalRead.Should().NotBeNull("after the concurrent write completes, the final entry should be fully observable");
+            finalRead.Results.Releases.Single().Guid.Should().Be("new-guid");
+            finalRead.Metadata.CachedTtlSecs.Should().Be(1200);
+        }
+
+        [Test]
+        public void Bypass_failure_logging_should_not_include_apikey_from_http_exception()
+        {
+            var controller = new NewznabController(null, null, null, null, null, null, null, null, TestLogger);
+            var logMethod = typeof(NewznabController).GetMethod("LogBypassFailure", BindingFlags.Instance | BindingFlags.NonPublic);
+
+            var sentinel = "APIKEY-SENTINEL-12345";
+            var request = new HttpRequest($"https://example.test/api?t=search&cat=5000&apikey={sentinel}");
+            var response = new HttpResponse(request, new HttpHeader(), new CookieCollection(), "upstream failure", statusCode: HttpStatusCode.BadGateway, version: new Version(1, 1));
+            var exception = new HttpException(request, response);
+            var identity = new CanonicalCacheIdentity(1, "v2:indexerId=1:cat=5000", Array.Empty<string>());
+            var metadata = new CachedEntryMetadata(DateTime.UtcNow, 600);
+
+            var target = new MemoryTarget("BypassFailureLogCapture") { Layout = "${message}" };
+            var rule = new LoggingRule("*", LogLevel.Debug, target);
+            LogManager.Configuration.AddTarget(target);
+            LogManager.Configuration.LoggingRules.Add(rule);
+            LogManager.ReconfigExistingLoggers();
+
+            try
+            {
+                logMethod.Invoke(controller, new object[] { "Indexer", identity, metadata, 0.75, true, exception });
+
+                target.Logs.Should().ContainSingle();
+                target.Logs.Single().Should().NotContain(sentinel);
+            }
+            finally
+            {
+                LogManager.Configuration.LoggingRules.Remove(rule);
+                LogManager.Configuration.RemoveTarget("BypassFailureLogCapture");
+                LogManager.ReconfigExistingLoggers();
+            }
+        }
+
+        [Test]
+        public void Canonical_identity_and_jaccard_stability_should_compose_across_equivalent_requests()
+        {
+            var capabilities = new IndexerCapabilities();
+            capabilities.Categories.AddCategoryMapping(NewznabStandardCategory.TV.Id, NewznabStandardCategory.TV);
+            capabilities.Categories.AddCategoryMapping(NewznabStandardCategory.TVSD.Id, NewznabStandardCategory.TVSD);
+            capabilities.Categories.AddCategoryMapping(NewznabStandardCategory.TVHD.Id, NewznabStandardCategory.TVHD);
+            capabilities.Categories.AddCategoryMapping(NewznabStandardCategory.TVUHD.Id, NewznabStandardCategory.TVUHD);
+
+            var parentRequest = MakeRequest(cat: "5000", extended: "0");
+            var explicitRequest = MakeRequest(cat: "5045, 5030, 5040, 5000", extended: null);
+            var reorderedRequest = MakeRequest(cat: "5030,5000,5040,5045", extended: "anything");
+            var parentIdentity = ResolveIdentity(1, parentRequest, capabilities);
+            var explicitIdentity = ResolveIdentity(1, explicitRequest, capabilities);
+            var reorderedIdentity = ResolveIdentity(1, reorderedRequest, capabilities);
+
+            parentIdentity.Key.Should().Be(explicitIdentity.Key);
+            explicitIdentity.Key.Should().Be(reorderedIdentity.Key);
+
+            Subject.Set(parentIdentity, parentRequest, MakeConsecutiveGuidResults(1, 95), TimeSpan.FromMinutes(10), "Indexer");
+            Subject.Set(explicitIdentity, explicitRequest, MakeConsecutiveGuidResults(6, 95), TimeSpan.FromMinutes(10), "Indexer");
+            Subject.Set(reorderedIdentity, reorderedRequest, MakeConsecutiveGuidResults(11, 95), TimeSpan.FromMinutes(10), "Indexer");
+
+            GetIndexerKeys()[1].Keys.Should().ContainSingle();
+            Subject.FindWithMetadata(parentIdentity, parentRequest).Should().NotBeNull();
+            Subject.FindWithMetadata(explicitIdentity, explicitRequest).Should().NotBeNull();
+            Subject.FindWithMetadata(reorderedIdentity, reorderedRequest).Should().NotBeNull();
+
+            var trackerCounts = GetStabilityTrackerCounts(parentIdentity.Key);
+            trackerCounts.Unchanged.Should().Be(2);
+            trackerCounts.Total.Should().Be(3);
+            Subject.GetAdaptiveTtl(parentIdentity, TimeSpan.FromSeconds(600)).TotalSeconds.Should().BeGreaterThan(600);
+        }
+
+        [Test]
+        public void Canonical_identity_and_age_scaled_bypass_should_share_metadata_and_match_curve()
+        {
+            var capabilities = new IndexerCapabilities();
+            capabilities.Categories.AddCategoryMapping(NewznabStandardCategory.TV.Id, NewznabStandardCategory.TV);
+            capabilities.Categories.AddCategoryMapping(NewznabStandardCategory.TVSD.Id, NewznabStandardCategory.TVSD);
+            capabilities.Categories.AddCategoryMapping(NewznabStandardCategory.TVHD.Id, NewznabStandardCategory.TVHD);
+
+            var parentRequest = MakeRequest(cat: "5000");
+            var explicitRequest = MakeRequest(cat: "5040,5030,5000", extended: "0");
+            var parentIdentity = ResolveIdentity(1, parentRequest, capabilities);
+            var explicitIdentity = ResolveIdentity(1, explicitRequest, capabilities);
+            parentIdentity.Key.Should().Be(explicitIdentity.Key);
+
+            Subject.Set(parentIdentity, parentRequest, MakeResults(3), TimeSpan.FromSeconds(600), "Indexer");
+
+            foreach (var ratio in new[] { 0.0, 0.25, 0.5, 0.75, 1.0 })
+            {
+                GetStringDictionary<CachedEntryMetadata>("_entryMetadata")[parentIdentity.Key] =
+                    new CachedEntryMetadata(DateTime.UtcNow.AddSeconds(-600 * ratio), 600);
+
+                var cachedEntry = Subject.FindWithMetadata(explicitIdentity, explicitRequest);
+                cachedEntry.Should().NotBeNull("canonically equivalent requests should share entry metadata");
+
+                var ageRatio = Math.Clamp((DateTime.UtcNow - cachedEntry.Metadata.CachedAtUtc).TotalSeconds / cachedEntry.Metadata.CachedTtlSecs, 0.0, 1.0);
+                var expectedProbability = ratio <= 0.5 ? 0.0 : ((ratio - 0.5) / 0.5) * 0.25;
+                var actualProbability = NewznabCacheQueryPolicy.GetBypassProbability(ageRatio);
+
+                actualProbability.Should().BeApproximately(expectedProbability, 0.01);
+                NewznabCacheQueryPolicy.ShouldBypassCacheHit(explicitRequest, atQueryLimit: false, ageRatio, sample: 0.0)
+                    .Should().Be(actualProbability > 0.0);
+
+                if (actualProbability > 0.0)
+                {
+                    NewznabCacheQueryPolicy.ShouldBypassCacheHit(explicitRequest, atQueryLimit: false, ageRatio, sample: actualProbability)
+                        .Should().BeFalse();
+                }
+            }
+        }
+
+        [Test]
+        public void Adaptive_ttl_and_bypass_cooldown_should_compose()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+
+            for (var i = 0; i < 3; i++)
+            {
+                Subject.Set(identity, request, MakeResults(3), TimeSpan.FromMinutes(10), "Indexer");
+            }
+
+            Subject.GetAdaptiveTtl(identity, TimeSpan.FromSeconds(600)).TotalSeconds.Should().BeGreaterThan(600);
+            Subject.RecordBypassFailure(identity, DateTime.UtcNow).Should().BeTrue();
+
+            NewznabCacheQueryPolicy.ShouldBypassCacheHit(
+                    request,
+                    atQueryLimit: false,
+                    ageRatio: 1.0,
+                    bypassSuppressedUntilUtc: Subject.GetBypassSuppressedUntilUtc(identity),
+                    sample: 0.0)
+                .Should().BeFalse("active cooldown suppresses bypass regardless of adaptive stability");
+
+            GetStringDictionary<DateTime>("_bypassSuppressedUntilUtc")[identity.Key] = DateTime.UtcNow.AddSeconds(-1);
+            Subject.GetBypassSuppressedUntilUtc(identity).Should().BeNull();
+
+            NewznabCacheQueryPolicy.ShouldBypassCacheHit(
+                    request,
+                    atQueryLimit: false,
+                    ageRatio: 1.0,
+                    bypassSuppressedUntilUtc: Subject.GetBypassSuppressedUntilUtc(identity),
+                    sample: 0.0)
+                .Should().BeTrue("once cooldown expires, age-scaled bypass behavior resumes");
+            Subject.GetAdaptiveTtl(identity, TimeSpan.FromSeconds(600)).TotalSeconds.Should().BeGreaterThan(600);
+        }
+
+        [Test]
+        public void Bypass_failure_path_should_serve_cache_record_suppression_and_redact_log()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            Subject.Set(identity, request, MakeGuidResults(new[] { "cached-guid" }), TimeSpan.FromMinutes(10), "Indexer");
+            var cachedEntry = Subject.FindWithMetadata(identity, request);
+
+            var controller = new NewznabController(null, null, null, null, null, null, null, null, TestLogger);
+            var logMethod = typeof(NewznabController).GetMethod("LogBypassFailure", BindingFlags.Instance | BindingFlags.NonPublic);
+            var sentinel = "APIKEY-SENTINEL-FAILURE-COMPOSE";
+            var httpRequest = new HttpRequest($"https://example.test/api?t=search&cat=5000&apikey={sentinel}");
+            var response = new HttpResponse(httpRequest, new HttpHeader(), new CookieCollection(), "upstream failure", statusCode: HttpStatusCode.BadGateway, version: new Version(1, 1));
+            var exception = new HttpException(httpRequest, response);
+            var target = new MemoryTarget("BypassFailureComposeLogCapture") { Layout = "${message}" };
+            var rule = new LoggingRule("*", LogLevel.Debug, target);
+
+            LogManager.Configuration.AddTarget(target);
+            LogManager.Configuration.LoggingRules.Add(rule);
+            LogManager.ReconfigExistingLoggers();
+
+            try
+            {
+                NewznabResults servedResults = null;
+
+                try
+                {
+                    throw exception;
+                }
+                catch (Exception ex)
+                {
+                    var suppressionRecorded = Subject.RecordBypassFailure(identity, DateTime.UtcNow);
+                    logMethod.Invoke(controller, new object[] { "Indexer", identity, cachedEntry.Metadata, 1.0, suppressionRecorded, ex });
+                    servedResults = cachedEntry.Results;
+                }
+
+                servedResults.Should().NotBeNull();
+                servedResults.Releases.Single().Guid.Should().Be("cached-guid");
+                GetStringDictionary<DateTime>("_bypassSuppressedUntilUtc").ContainsKey(identity.Key).Should().BeTrue();
+                Subject.GetBypassSuppressedUntilUtc(identity).Should().NotBeNull();
+                target.Logs.Should().ContainSingle();
+                target.Logs.Single().Should().NotContain(sentinel);
+                target.Logs.Single().Should().NotContain("apikey=");
+                target.Logs.Single().Should().NotContain("https://example.test");
+            }
+            finally
+            {
+                LogManager.Configuration.LoggingRules.Remove(rule);
+                LogManager.Configuration.RemoveTarget("BypassFailureComposeLogCapture");
+                LogManager.ReconfigExistingLoggers();
+            }
+        }
+
+        [TestCase("cleanup-key-tracking")]
+        [TestCase("invalidate-indexer")]
+        [TestCase("clear")]
+        [TestCase("prune-expired-remove-tracking")]
+        public void Cleanup_paths_should_remove_entry_bound_state_and_previous_guid_sets(string cleanupPath)
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            PopulateAdjunctState(1, request, TimeSpan.FromMilliseconds(25));
+
+            switch (cleanupPath)
+            {
+                case "cleanup-key-tracking":
+                    GetCacheStore().Remove(identity.Key);
+                    InvokeCleanupKeyTracking(identity.Key);
+                    break;
+                case "invalidate-indexer":
+                    Subject.InvalidateIndexer(1);
+                    break;
+                case "clear":
+                    Subject.Clear();
+                    break;
+                case "prune-expired-remove-tracking":
+                    Thread.Sleep(75);
+                    InvokePruneExpiredKeys(1, preserveTracking: false);
+                    break;
+                default:
+                    Assert.Fail($"Unknown cleanup path {cleanupPath}");
+                    break;
+            }
+
+            AssertAdjunctStateRemoved(identity.Key, previousGuidSetsRemoved: true);
+        }
+
+        [Test]
+        public void PruneExpiredKeys_should_preserve_previous_guid_sets_for_recent_tracking_but_remove_entry_bound_state()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            PopulateAdjunctState(1, request, TimeSpan.FromMilliseconds(25));
+
+            Thread.Sleep(75);
+            InvokePruneExpiredKeys(1, preserveTracking: true);
+
+            AssertAdjunctStateRemoved(identity.Key, previousGuidSetsRemoved: false);
+            PrivateDictionaryContainsKey("_stabilityTrackers", identity.Key).Should().BeTrue();
+        }
+
+        [Test]
+        public void PruneExpiredKeys_should_clear_orphaned_metadata_on_follow_up_sweep()
+        {
+            var request = MakeRequest(cat: "5000");
+            var identity = ResolveIdentity(1, request);
+            PopulateAdjunctState(1, request, TimeSpan.FromMilliseconds(25));
+
+            Thread.Sleep(75);
+            GetCacheStore().Find(identity.Key).Should().BeNull("direct cache read should inline-evict the expired entry");
+            GetStringDictionary<CachedEntryMetadata>("_entryMetadata").ContainsKey(identity.Key).Should().BeTrue("metadata survives until prune reaps the orphan");
+
+            InvokePruneExpiredKeys(1, preserveTracking: false);
+
+            AssertAdjunctStateRemoved(identity.Key, previousGuidSetsRemoved: true);
         }
 
         // ── Clear resets stability ────────────────────────────────────────────
