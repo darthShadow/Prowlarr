@@ -36,6 +36,7 @@ namespace NzbDrone.Api.V1.Indexers
         private IDownloadMappingService _downloadMappingService { get; set; }
         private IDownloadService _downloadService { get; set; }
         private INewznabResultsCacheService _cacheService { get; set; }
+        private INewznabCacheIdentityResolver _cacheIdentityResolver { get; set; }
         private readonly Logger _logger;
 
         public NewznabController(IndexerFactory indexerFactory,
@@ -45,6 +46,7 @@ namespace NzbDrone.Api.V1.Indexers
             IDownloadMappingService downloadMappingService,
             IDownloadService downloadService,
             INewznabResultsCacheService cacheService,
+            INewznabCacheIdentityResolver cacheIdentityResolver,
             Logger logger)
         {
             _indexerFactory = indexerFactory;
@@ -54,6 +56,7 @@ namespace NzbDrone.Api.V1.Indexers
             _downloadMappingService = downloadMappingService;
             _downloadService = downloadService;
             _cacheService = cacheService;
+            _cacheIdentityResolver = cacheIdentityResolver;
             _logger = logger;
         }
 
@@ -176,6 +179,7 @@ namespace NzbDrone.Api.V1.Indexers
 
                     // Resolve cache TTL from three-tier config (request → indexer → global)
                     var indexerSettings = (IIndexerSettings)indexerDef.Settings;
+                    var cacheIdentity = _cacheIdentityResolver.Resolve(id, request, indexer.GetCapabilities());
                     var cacheTtl = _cacheService.ResolveTtl(id, request.cachetime, indexerSettings.BaseSettings.CacheTtlMinutes);
 
                     var usesAdaptiveRssCaching = NewznabCacheQueryPolicy.UsesAdaptiveRssCaching(request);
@@ -183,26 +187,27 @@ namespace NzbDrone.Api.V1.Indexers
                     // Extend TTL for RSS-like queries based on result stability
                     if (cacheTtl.HasValue && usesAdaptiveRssCaching)
                     {
-                        cacheTtl = _cacheService.GetAdaptiveTtl(id, request, cacheTtl.Value);
+                        cacheTtl = _cacheService.GetAdaptiveTtl(cacheIdentity, cacheTtl.Value);
                     }
 
                     // Fast path: serve from cache (no lock needed)
                     if (cacheTtl.HasValue)
                     {
-                        var cachedResults = _cacheService.Find(id, request);
-                        if (cachedResults != null)
+                        var cachedEntry = _cacheService.FindWithMetadata(cacheIdentity, request);
+                        if (cachedEntry != null)
                         {
-                            // Probabilistic bypass: ~2% of adaptive-RSS cache hits go upstream to detect
-                            // new content before TTL expiry (e.g., morning release floods after
-                            // a quiet night builds high stability). Intentionally skips the dedup
-                            // lock — concurrent bypass collisions are negligible at this rate.
-                            // Skipped when at query limit to avoid wasting budget. Falls back to
-                            // cached result on any upstream exception.
-                            // See NewznabCacheQueryPolicy for planned age-scaled improvement.
+                            var ageRatio = CalculateAgeRatio(cachedEntry.Metadata);
+                            var bypassSuppressedUntilUtc = _cacheService.GetBypassSuppressedUntilUtc(cacheIdentity);
+
+                            // Phase 1 keeps the existing unlocked bypass path, but scales the
+                            // bypass probability by cache age and suppresses retries for 30s
+                            // after a bypass failure.
                             if (usesAdaptiveRssCaching
                                 && NewznabCacheQueryPolicy.ShouldBypassCacheHit(
                                         request,
-                                        _indexerLimitService.AtQueryLimit(indexerDef)))
+                                        _indexerLimitService.AtQueryLimit(indexerDef),
+                                        ageRatio,
+                                        bypassSuppressedUntilUtc))
                             {
                                 try
                                 {
@@ -210,11 +215,12 @@ namespace NzbDrone.Api.V1.Indexers
                                 }
                                 catch (Exception ex)
                                 {
-                                    _logger.Debug(ex, "Probabilistic bypass failed for indexer {0}, serving cached result", indexerDef.Name);
+                                    var suppressionRecorded = _cacheService.RecordBypassFailure(cacheIdentity, DateTime.UtcNow);
+                                    LogBypassFailure(indexerDef.Name, cacheIdentity, cachedEntry.Metadata, ageRatio, suppressionRecorded, ex);
                                 }
                             }
 
-                            return CreateSearchResponse(cachedResults, request, indexer, indexerDef, cloneReleases: true);
+                            return CreateSearchResponse(cachedEntry.Results, request, indexer, indexerDef, cloneReleases: true);
                         }
                     }
 
@@ -226,7 +232,7 @@ namespace NzbDrone.Api.V1.Indexers
                         // explicitly want a fresh upstream call.
                         if (!forceUpstream && cacheTtl.HasValue)
                         {
-                            var deduped = _cacheService.FindForRecheck(id, request);
+                            var deduped = _cacheService.FindForRecheck(cacheIdentity);
                             if (deduped != null)
                             {
                                 return CreateSearchResponse(deduped, request, indexer, indexerDef, cloneReleases: true);
@@ -271,7 +277,7 @@ namespace NzbDrone.Api.V1.Indexers
                                 {
                                     Releases = results.Releases.Select(r => (ReleaseInfo)r.Clone()).ToList()
                                 };
-                                _cacheService.Set(id, request, resultsToCache, cacheTtl.Value, indexerDef.Name);
+                                _cacheService.Set(cacheIdentity, request, resultsToCache, cacheTtl.Value, indexerDef.Name);
                             }
                             else
                             {
@@ -279,7 +285,7 @@ namespace NzbDrone.Api.V1.Indexers
                                 // repeated upstream queries for searches that genuinely return nothing,
                                 // while still allowing newly available content to appear within 60s.
                                 var negativeTtl = TimeSpan.FromSeconds(Math.Min(60, cacheTtl.Value.TotalSeconds));
-                                _cacheService.Set(id, request, new NewznabResults { Releases = new List<ReleaseInfo>() }, negativeTtl, indexerDef.Name);
+                                _cacheService.Set(cacheIdentity, request, new NewznabResults { Releases = new List<ReleaseInfo>() }, negativeTtl, indexerDef.Name);
                             }
                         }
 
@@ -290,7 +296,7 @@ namespace NzbDrone.Api.V1.Indexers
                     if (cacheTtl.HasValue)
                     {
                         // Lambda required — SearchAsync has a bool param; Func<Task<T>> takes zero params
-                        return await _cacheService.DeduplicateAsync<IActionResult>(id, request, () => SearchAsync());
+                        return await _cacheService.DeduplicateAsync<IActionResult>(cacheIdentity, () => SearchAsync());
                     }
 
                     return await SearchAsync();
@@ -448,6 +454,24 @@ namespace NzbDrone.Api.V1.Indexers
         private static int CalculateRetryAfterDisabledTill(DateTime disabledTill)
         {
             return Convert.ToInt32(disabledTill.ToLocalTime().Subtract(DateTime.Now).TotalSeconds);
+        }
+
+        private static double CalculateAgeRatio(CachedEntryMetadata metadata)
+        {
+            var ageSeconds = Math.Max(0, (DateTime.UtcNow - metadata.CachedAtUtc).TotalSeconds);
+            return Math.Clamp(ageSeconds / metadata.CachedTtlSecs, 0.0, 1.0);
+        }
+
+        private void LogBypassFailure(string indexerName, CanonicalCacheIdentity identity, CachedEntryMetadata metadata, double ageRatio, bool suppressionRecorded, Exception ex)
+        {
+            _logger.Debug(
+                "Probabilistic bypass failed for indexer {0}, key {1}, cachedAt {2:o}, ageRatio {3:F2}, suppressionRecorded={4}, exceptionType={5}; serving cached result",
+                indexerName,
+                identity.Key,
+                metadata.CachedAtUtc,
+                ageRatio,
+                suppressionRecorded,
+                ex.GetType().Name);
         }
 
         private IActionResult CreateSearchResponse(NewznabResults results, NewznabRequest request, IIndexer indexer, IndexerDefinition indexerDef, bool cloneReleases)
