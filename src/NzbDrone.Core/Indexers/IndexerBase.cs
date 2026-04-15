@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -101,26 +103,44 @@ namespace NzbDrone.Core.Indexers
 
         public abstract IndexerCapabilities GetCapabilities();
 
+        private static string BuildFallbackGuid(int indexerId, string fallbackUrl)
+        {
+            var input = Encoding.UTF8.GetBytes($"{indexerId.ToString(CultureInfo.InvariantCulture)}:{fallbackUrl}");
+
+            return "prowlarr:" + Convert.ToHexStringLower(SHA256.HashData(input));
+        }
+
         protected virtual IList<ReleaseInfo> CleanupReleases(IEnumerable<ReleaseInfo> releases, SearchCriteriaBase searchCriteria)
         {
             var result = releases.ToList();
 
             result.ForEach(c =>
             {
-                //Set GUID if not set
+                // The fallback GUID is a hash of the indexer id and the fallback URL so the GUID never carries the URL or its credentials.
                 if (c.Guid.IsNullOrWhiteSpace())
                 {
+                    string fallbackUrl = null;
+
                     if (c.DownloadUrl.IsNotNullOrWhiteSpace())
                     {
-                        c.Guid = c.DownloadUrl;
+                        fallbackUrl = c.DownloadUrl;
                     }
                     else if (Protocol == DownloadProtocol.Torrent && ((TorrentInfo)c).MagnetUrl.IsNotNullOrWhiteSpace())
                     {
-                        c.Guid = ((TorrentInfo)c).MagnetUrl;
+                        fallbackUrl = ((TorrentInfo)c).MagnetUrl;
                     }
                     else if (c.InfoUrl.IsNotNullOrWhiteSpace())
                     {
-                        c.Guid = c.InfoUrl;
+                        fallbackUrl = c.InfoUrl;
+                    }
+
+                    if (fallbackUrl != null)
+                    {
+                        c.Guid = BuildFallbackGuid(Definition.Id, fallbackUrl);
+                    }
+                    else
+                    {
+                        _logger.Warn("Release from indexer {0} has no stable identity after GUID fallback chain: title={1}", Definition.Name, c.Title);
                     }
                 }
 
